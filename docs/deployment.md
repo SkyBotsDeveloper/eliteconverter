@@ -9,12 +9,14 @@
 
 ## Cloudflare Resources
 
-Create these resources in the target Cloudflare account:
+Create these resources separately in each target Cloudflare account/environment:
 
-- D1 database named `eliteconverter`.
-- Queue named `eliteconverter-conversions`.
-- Turnstile site and secret keys.
-- Workers Rate Limiting namespace if available on the account.
+- Staging D1 database, for example `eliteconverter-staging`.
+- Production D1 database, for example `eliteconverter-production`.
+- Staging Queue, for example `eliteconverter-staging-conversions`.
+- Production Queue, for example `eliteconverter-production-conversions`.
+- Staging and production Turnstile site and secret keys.
+- Staging and production Workers Rate Limiting namespaces if available on the account.
 
 Update `wrangler.toml` environment blocks with the real D1 database IDs and queue names. Do not commit Cloudflare account IDs or secret values.
 
@@ -28,7 +30,13 @@ corepack pnpm wrangler secret put CLIENT_WEBHOOK_SIGNING_SECRET
 corepack pnpm wrangler secret put TURNSTILE_SECRET_KEY
 corepack pnpm wrangler secret put GENERIC_PROVIDER_API_KEY
 corepack pnpm wrangler secret put GENERIC_PROVIDER_WEBHOOK_SECRET
+corepack pnpm wrangler secret put CLOUDCONVERT_API_KEY
+corepack pnpm wrangler secret put CLOUDCONVERT_WEBHOOK_SIGNING_SECRET
 ```
+
+Run the same secret commands with `--env staging` and `--env production` and use different values
+where the provider, Turnstile or webhook endpoint requires isolation. `wrangler.toml` includes
+explicit staging and production binding blocks; do not rely on top-level bindings being inherited.
 
 ## Migrations
 

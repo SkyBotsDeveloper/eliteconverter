@@ -22,13 +22,23 @@ export default function Job() {
     queryFn: () => api.events(jobId),
     enabled: Boolean(jobId),
   });
+  const downloadQuery = useQuery({
+    queryKey: ["job-download", jobId],
+    queryFn: () => api.download(jobId),
+    enabled: Boolean(jobId) && jobQuery.data?.status === "completed",
+    staleTime: 60_000,
+    retry: false,
+  });
   const cancel = useMutation({
     mutationFn: () => api.cancel(jobId),
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ["job", jobId] }),
   });
   const refresh = useMutation({
     mutationFn: () => api.refreshDownload(jobId),
-    onSuccess: () => queryClient.invalidateQueries({ queryKey: ["job", jobId] }),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["job", jobId] });
+      queryClient.invalidateQueries({ queryKey: ["job-download", jobId] });
+    },
   });
 
   if (jobQuery.isLoading) return <div className="route-loading">Loading job...</div>;
@@ -97,8 +107,8 @@ export default function Job() {
           <RefreshCcw aria-hidden="true" className="icon" /> Refresh URL
         </Button>
         <a
-          className={job.outputUrl ? "primary-link" : "primary-link disabled"}
-          href={job.outputUrl ?? "#"}
+          className={downloadQuery.data?.url ? "primary-link" : "primary-link disabled"}
+          href={downloadQuery.data?.url ?? "#"}
         >
           <Download aria-hidden="true" /> Download
         </a>

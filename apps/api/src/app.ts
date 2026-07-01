@@ -12,12 +12,13 @@ import { authenticateApiKey } from "./auth";
 import { getConfig } from "./config";
 import { ok, fail, parseJson, securityHeaders } from "./http";
 import {
-  cancelJob,
+  cancelStoredJob,
   createConversionJob,
   getCapabilities,
-  getExistingJob,
+  getAuthorizedJob,
+  getDownloadForJob,
   handleProviderWebhook,
-  processConversionJob,
+  processQueuePayload,
   reconcileJobs,
   refreshDownload,
   toPublicJob,
@@ -120,7 +121,7 @@ export const createApp = () => {
     await enforceRateLimit(principal.scope, context);
     const body = await parseJson<unknown>(c.req.raw);
     const input = conversionRequestSchema.parse(body);
-    const job = await createConversionJob(
+    const result = await createConversionJob(
       input,
       principal,
       context,
@@ -128,9 +129,10 @@ export const createApp = () => {
     );
     return ok(
       {
-        jobId: job.publicId,
-        status: job.status,
-        statusUrl: `/api/v1/conversions/${job.publicId}`,
+        jobId: result.job.publicId,
+        status: result.job.status,
+        statusUrl: `/api/v1/conversions/${result.job.publicId}`,
+        existing: result.existing,
       },
       c.get("requestId"),
       { status: 202 },
@@ -152,12 +154,13 @@ export const createApp = () => {
       c.req.header("cf-connecting-ip") ?? undefined,
       context,
     );
-    const job = await createConversionJob(body, undefined, context, undefined, sessionId);
+    const result = await createConversionJob(body, undefined, context, undefined, sessionId);
     return ok(
       {
-        jobId: job.publicId,
-        status: job.status,
-        statusUrl: `/api/v1/conversions/${job.publicId}`,
+        jobId: result.job.publicId,
+        status: result.job.status,
+        statusUrl: `/api/v1/conversions/${result.job.publicId}`,
+        accessToken: result.accessToken,
       },
       c.get("requestId"),
       { status: 202 },
@@ -165,25 +168,35 @@ export const createApp = () => {
   });
 
   api.get("/conversions/:jobId", async (c) => {
-    const job = await getExistingJob(c.req.param("jobId"), c.get("context"));
+    const job = await getAuthorizedJob(c.req.raw, c.req.param("jobId"), c.get("context"));
     return ok(toPublicJob(job), c.get("requestId"));
   });
 
   api.get("/conversions/:jobId/events", async (c) => {
     const context = c.get("context");
-    const job = await getExistingJob(c.req.param("jobId"), context);
+    const job = await getAuthorizedJob(c.req.raw, c.req.param("jobId"), context);
     const events = await context.repository.listJobEvents(job.id);
     return ok({ events }, c.get("requestId"));
   });
 
   api.post("/conversions/:jobId/cancel", async (c) => {
-    const job = await cancelJob(c.req.param("jobId"), c.get("context"));
+    const context = c.get("context");
+    const authorized = await getAuthorizedJob(c.req.raw, c.req.param("jobId"), context);
+    const job = await cancelStoredJob(authorized, context);
     return ok(toPublicJob(job), c.get("requestId"));
   });
 
   api.post("/conversions/:jobId/refresh-download", async (c) => {
-    const job = await refreshDownload(c.req.param("jobId"), c.get("context"));
+    const context = c.get("context");
+    const authorized = await getAuthorizedJob(c.req.raw, c.req.param("jobId"), context);
+    const job = await refreshDownload(authorized, context);
     return ok(toPublicJob(job), c.get("requestId"));
+  });
+
+  api.get("/conversions/:jobId/download", async (c) => {
+    const context = c.get("context");
+    const job = await getAuthorizedJob(c.req.raw, c.req.param("jobId"), context);
+    return ok(getDownloadForJob(job), c.get("requestId"));
   });
 
   api.post("/webhooks/providers/:provider", async (c) => {
@@ -196,6 +209,7 @@ export const createApp = () => {
 
   api.post("/webhooks/test", async (c) => {
     const context = c.get("context");
+    if (context.config.appEnv === "production") throw new PublicApiError("not_found", 404);
     const body = await parseJson<unknown>(c.req.raw);
     return ok(
       { received: true, echo: body, timestamp: new Date().toISOString() },
@@ -241,7 +255,7 @@ export const app = createApp();
 export const handleQueueBatch = async (
   batch: MessageBatch<QueuePayload>,
   env: Env,
-  ctx: ExecutionContext,
+  _ctx: ExecutionContext,
 ): Promise<void> => {
   const config = getConfig(env);
   const repository = getRepository(env);
@@ -253,8 +267,25 @@ export const handleQueueBatch = async (
       repository,
       fetcher: env.TEST_FETCH ?? fetch,
     };
-    ctx.waitUntil(processConversionJob(message.body.jobId, context));
-    message.ack();
+    try {
+      await processQueuePayload(message.body, context);
+      await repository.completeScheduledTask(message.body.dedupeKey);
+      message.ack();
+    } catch (error) {
+      const publicError = error instanceof PublicApiError ? error.publicError : undefined;
+      if (publicError?.retryable) {
+        message.retry();
+      } else {
+        logError({
+          requestId: message.body.requestId,
+          jobId: message.body.jobId,
+          errorCode: publicError?.code ?? "internal_error",
+          message: error instanceof Error ? error.message : String(error),
+        });
+        await repository.completeScheduledTask(message.body.dedupeKey);
+        message.ack();
+      }
+    }
   }
 };
 

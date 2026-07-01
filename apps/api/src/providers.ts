@@ -1,4 +1,5 @@
 import {
+  CloudConvertProvider,
   GenericHttpProvider,
   MockProvider,
   PublicApiError,
@@ -9,8 +10,36 @@ import type { AppConfig } from "./types";
 export const getProviders = (config: AppConfig): ConversionProvider[] => {
   const providers = new Map<string, ConversionProvider>();
 
+  if (config.appEnv === "production" && config.enabledProviders.includes("mock")) {
+    throw new PublicApiError(
+      "internal_configuration_error",
+      500,
+      "MockProvider cannot be enabled in production",
+    );
+  }
+
   if (config.enabledProviders.includes("mock")) {
-    providers.set("mock", new MockProvider());
+    providers.set(
+      "mock",
+      new MockProvider({
+        formats: config.mockProviderFormats,
+        qualities: config.mockProviderQualities,
+      }),
+    );
+  }
+
+  if (config.enabledProviders.includes("cloudconvert")) {
+    providers.set(
+      "cloudconvert",
+      new CloudConvertProvider({
+        baseUrl: config.cloudConvertProvider.baseUrl,
+        apiKey: config.cloudConvertProvider.apiKey,
+        webhookSigningSecret: config.cloudConvertProvider.webhookSigningSecret,
+        formats: config.cloudConvertProvider.formats,
+        qualities: config.cloudConvertProvider.qualities,
+        timeoutMs: config.cloudConvertProvider.timeoutMs,
+      }),
+    );
   }
 
   if (config.enabledProviders.includes("generic")) {

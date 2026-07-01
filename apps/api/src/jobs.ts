@@ -4,42 +4,78 @@ import {
   clientWebhookHeaders,
   conversionRequestSchema,
   fingerprintRequest,
+  hashApiKey,
   isRetryableError,
   nextCircuitState,
   publicErrorCatalog,
   randomId,
+  randomToken,
   redactUrl,
   responsibleUseNotice,
   sanitizeDiagnostic,
   signWebhookPayload,
+  timingSafeEqual,
   toPublicError,
   validateExternalUrl,
+  validateRedirectChain,
   type CapabilitiesResponse,
-  type ConversionProvider,
   type ConversionRequest,
   type JobEvent,
+  type OutputFormat,
+  type ProviderCapabilities,
+  type ProviderDownloadResult,
   type PublicJob,
+  type QualityOption,
 } from "@eliteconverter/shared";
+import { authenticateApiKey } from "./auth";
 import { getProviders } from "./providers";
+import type {
+  ClientWebhookEvent,
+  QueuePayload,
+  RequestContext,
+  ScheduledTask,
+  StoredJob,
+  StoredProviderAttempt,
+} from "./types";
 import type { AuthenticatedPrincipal } from "./auth";
-import type { RequestContext, StoredJob, StoredProviderAttempt } from "./types";
 
-const terminalStatuses = new Set(["completed", "failed", "cancelled", "expired"]);
+export interface CreateConversionResult {
+  job: StoredJob;
+  accessToken?: string;
+  existing: boolean;
+}
+
+const terminalStatuses = new Set<StoredJob["status"]>([
+  "completed",
+  "failed",
+  "cancelled",
+  "expired",
+]);
+
+const retryableWebhookStatuses = new Set([408, 425, 429]);
 
 export const getCapabilities = async (context: RequestContext): Promise<CapabilitiesResponse> => {
   const providers = getProviders(context.config);
+  const providerDetails = await Promise.all(
+    providers.map(async (provider) => ({
+      id: provider.id,
+      displayName: provider.displayName,
+      capabilities: await provider.getCapabilities(),
+    })),
+  );
+  const formats = intersectCapabilities(
+    providerDetails.map((provider) => provider.capabilities.formats),
+  );
+  const qualities = intersectCapabilities(
+    providerDetails.map((provider) => provider.capabilities.qualities),
+  );
+
   return {
     product: "EliteConverter",
     tagline: "Convert Streams. Deliver Anywhere.",
-    formats: ["mp4", "webm", "mkv", "mp3", "m4a"],
-    qualities: ["source", "1080p", "720p", "480p", "audio"],
-    providers: await Promise.all(
-      providers.map(async (provider) => ({
-        id: provider.id,
-        displayName: provider.displayName,
-        capabilities: await provider.getCapabilities(),
-      })),
-    ),
+    formats,
+    qualities,
+    providers: providerDetails,
     responsibleUseNotice,
   };
 };
@@ -50,11 +86,14 @@ export const createConversionJob = async (
   context: RequestContext,
   idempotencyKey?: string,
   anonymousSessionId?: string,
-): Promise<StoredJob> => {
+): Promise<CreateConversionResult> => {
   const parsed = conversionRequestSchema.parse(input);
+  const capabilities = await getCapabilities(context);
+  assertSupportedRequest(parsed, capabilities);
+
   const source = validateExternalUrl(parsed.url);
   const callback = parsed.callbackUrl
-    ? validateExternalUrl(parsed.callbackUrl, "invalid_source_url")
+    ? validateCallbackUrl(parsed.callbackUrl, context)
     : undefined;
   const ownerScope = principal
     ? `api:${principal.apiKey.id}`
@@ -64,20 +103,12 @@ export const createConversionJob = async (
   const max = principal
     ? context.config.maxConcurrentJobsPerUser
     : context.config.maxAnonymousJobsPerDay;
-  if (activeCount >= max)
+  if (activeCount >= max) {
     throw new PublicApiError("rate_limited", 429, "Concurrent job limit reached");
-
-  const fingerprint = await fingerprintRequest(ownerScope, parsed);
-  if (idempotencyKey) {
-    const existing = await context.repository.findJobByIdempotency(ownerScope, idempotencyKey);
-    if (existing) {
-      if (existing.requestFingerprint !== fingerprint) {
-        throw new PublicApiError("idempotency_conflict", 409);
-      }
-      return existing;
-    }
   }
 
+  const fingerprint = await fingerprintRequest(ownerScope, parsed);
+  const accessToken = principal ? undefined : `ec_access_${randomToken(48)}`;
   const now = new Date();
   const job: StoredJob = {
     id: randomId("job", 24),
@@ -100,39 +131,83 @@ export const createConversionJob = async (
     expiresAt: new Date(
       now.getTime() + context.config.jobExpirationHours * 60 * 60 * 1000,
     ).toISOString(),
+    accessTokenHash: accessToken
+      ? await hashApiKey(accessToken, context.config.apiKeyHashSecret)
+      : undefined,
     idempotencyKey,
     requestFingerprint: fingerprint,
     callbackUrl: callback?.url,
+    callbackUrlPrivate: callback?.url,
+    callbackUrlRedacted: callback?.redactedUrl,
+    pollAttemptCount: 0,
   };
 
-  await context.repository.insertJob(job);
-  if (idempotencyKey) {
-    await context.repository.insertIdempotency(ownerScope, idempotencyKey, fingerprint, job.id);
+  const created = await context.repository.createJobWithIdempotency({
+    job,
+    scope: ownerScope,
+    idempotencyKey,
+    fingerprint,
+  });
+
+  if (created.existing) {
+    if (created.job.requestFingerprint !== fingerprint) {
+      throw new PublicApiError("idempotency_conflict", 409);
+    }
+    return { job: created.job, existing: true };
   }
+
   await addEvent(context, job, "conversion.queued", "Conversion job queued.");
+  await enqueueStage(context, {
+    kind: "submit_provider_job",
+    jobId: job.id,
+    requestId: context.requestId,
+    dedupeKey: `${job.id}:submit_provider_job:0`,
+  });
 
-  await context.env.CONVERSION_QUEUE?.send({ jobId: job.id, requestId: context.requestId });
-  if (!context.env.CONVERSION_QUEUE) {
-    await processConversionJob(job.id, context);
-  }
-
-  return (await context.repository.getJobById(job.id)) ?? job;
+  return {
+    job: (await context.repository.getJobById(job.id)) ?? job,
+    accessToken,
+    existing: false,
+  };
 };
 
-export const processConversionJob = async (
-  jobId: string,
+export const processQueuePayload = async (
+  payload: QueuePayload,
   context: RequestContext,
 ): Promise<void> => {
+  if (await context.repository.hasProcessedQueueDelivery(payload.dedupeKey)) return;
+
+  switch (payload.kind) {
+    case "submit_provider_job":
+      await submitProviderJob(payload.jobId, context);
+      break;
+    case "poll_provider_job":
+      await pollProviderJob(payload.jobId, context);
+      break;
+    case "refresh_provider_job":
+      await refreshDownloadByInternalId(payload.jobId, context);
+      break;
+    case "deliver_client_webhook":
+      if (!payload.webhookEventId) throw new PublicApiError("validation_error", 400);
+      await processClientWebhookDelivery(payload.webhookEventId, context);
+      break;
+    case "reconcile_stuck_job":
+      await reconcileOneJob(payload.jobId, context);
+      break;
+  }
+
+  await context.repository.markQueueDeliveryProcessed(payload.dedupeKey);
+};
+
+export const submitProviderJob = async (jobId: string, context: RequestContext): Promise<void> => {
   const job = await context.repository.getJobById(jobId);
   if (!job || terminalStatuses.has(job.status)) return;
-  if (job.status === "cancel_requested") {
-    await updateJob(context, {
-      ...job,
-      status: "cancelled",
-      progress: 100,
-      currentStage: "cancelled",
-    });
-    await addEvent(context, job, "conversion.cancelled", "Conversion job cancelled.");
+  if (new Date(job.expiresAt) <= new Date()) {
+    await expireJob(context, job);
+    return;
+  }
+  if (job.providerJobId && job.providerId) {
+    await schedulePoll(context, job, 0);
     return;
   }
 
@@ -140,43 +215,55 @@ export const processConversionJob = async (
   let lastError: unknown;
 
   for (const provider of providers.slice(0, context.config.maxProviderAttempts)) {
-    const health = await getHealth(context, provider.id);
-    const probed = nextCircuitState(health, "probe", {
-      threshold: context.config.circuitBreakerThreshold,
-      cooldownSeconds: context.config.circuitBreakerCooldownSeconds,
-    });
-    await context.repository.setProviderHealth(probed);
-    if (probed.state === "open") continue;
+    const capabilities = await provider.getCapabilities();
+    if (!providerSupportsJob(capabilities, job)) continue;
+    const health = await probeHealth(context, provider.id);
+    if (health.state === "open") continue;
 
     const attempt = startAttempt(job, provider.id);
     try {
       await context.repository.addProviderAttempt(attempt);
-      const submitted = await submitToProvider(provider, job, context);
-      const current = {
+      const submitted = await provider.createJob(
+        {
+          jobId: job.id,
+          idempotencyKey: job.idempotencyKey,
+          sourceUrl: job.inputUrl,
+          format: job.format,
+          quality: job.quality,
+          callbackUrl: job.callbackUrlPrivate,
+        },
+        {
+          requestId: context.requestId,
+          deadlineMs: Date.now() + context.config.genericProvider.timeoutMs,
+          fetcher: context.fetcher,
+        },
+      );
+      const updated = {
         ...job,
         status: submitted.status === "retrying" ? "retrying" : "processing",
         providerId: provider.id,
         providerJobId: submitted.providerJobId,
         providerAttemptCount: job.providerAttemptCount + 1,
-        progress: submitted.status === "retrying" ? 35 : 50,
+        progress: submitted.status === "retrying" ? 35 : 25,
         currentStage: submitted.status,
       } satisfies StoredJob;
-      await updateJob(context, current);
-      await addEvent(context, current, "conversion.processing", "Provider accepted the job.");
-
-      const completed = await pollProviderToTerminal(provider, current, context);
-      await context.repository.setProviderHealth(
-        nextCircuitState(probed, "success", {
-          threshold: context.config.circuitBreakerThreshold,
-          cooldownSeconds: context.config.circuitBreakerCooldownSeconds,
-        }),
-      );
+      await updateJob(context, updated);
       await context.repository.addProviderAttempt({
         ...attempt,
-        status: "completed",
-        providerJobId: completed.providerJobId,
+        status: "submitted",
+        providerJobId: submitted.providerJobId,
         finishedAt: new Date().toISOString(),
       });
+      await addEvent(context, updated, "conversion.processing", "Provider accepted the job.");
+      await context.repository.setProviderHealth(
+        nextCircuitState(health, "success", circuitOptions(context)),
+      );
+
+      if (submitted.status === "completed" && submitted.download) {
+        await completeJob(context, updated, submitted.download);
+      } else {
+        await schedulePoll(context, updated, context.config.initialRetryDelayMs);
+      }
       return;
     } catch (error) {
       lastError = error;
@@ -189,32 +276,104 @@ export const processConversionJob = async (
         finishedAt: new Date().toISOString(),
       });
       await context.repository.setProviderHealth(
-        nextCircuitState(probed, "failure", {
-          threshold: context.config.circuitBreakerThreshold,
-          cooldownSeconds: context.config.circuitBreakerCooldownSeconds,
-        }),
+        nextCircuitState(health, "failure", circuitOptions(context)),
       );
       if (!isRetryableError(publicError.code)) break;
     }
   }
 
-  const publicError = toPublicError(lastError);
-  const failed = {
-    ...((await context.repository.getJobById(jobId)) ?? job),
-    status: "failed",
-    progress: 100,
-    currentStage: "failed",
-    publicErrorCode: publicError.code,
-    publicErrorMessage: publicError.message,
-    internalDiagnostic: sanitizeDiagnostic(lastError),
-  } satisfies StoredJob;
-  await updateJob(context, failed);
-  await addEvent(context, failed, "conversion.failed", publicError.message);
-  await deliverClientWebhook(context, failed, "conversion.failed");
+  await failJob(context, job, lastError);
 };
 
-export const cancelJob = async (publicId: string, context: RequestContext): Promise<StoredJob> => {
-  const job = await getExistingJob(publicId, context);
+export const pollProviderJob = async (jobId: string, context: RequestContext): Promise<void> => {
+  const job = await context.repository.getJobById(jobId);
+  if (!job || terminalStatuses.has(job.status)) return;
+  if (new Date(job.expiresAt) <= new Date()) {
+    await expireJob(context, job);
+    return;
+  }
+  if (job.status === "cancel_requested") {
+    await cancelStoredJob(job, context);
+    return;
+  }
+  if (!job.providerId || !job.providerJobId) {
+    await enqueueStage(context, {
+      kind: "submit_provider_job",
+      jobId: job.id,
+      requestId: context.requestId,
+      dedupeKey: `${job.id}:submit_provider_job:missing-provider`,
+    });
+    return;
+  }
+
+  const provider = getProviders(context.config).find(
+    (candidate) => candidate.id === job.providerId,
+  );
+  if (!provider) throw new PublicApiError("internal_configuration_error", 500);
+
+  try {
+    const status = await provider.getJobStatus(job.providerJobId, {
+      requestId: context.requestId,
+      deadlineMs: Date.now() + context.config.genericProvider.timeoutMs,
+      fetcher: context.fetcher,
+    });
+
+    if (status.status === "completed" && status.download) {
+      await completeJob(context, job, status.download);
+      await context.repository.setProviderHealth(
+        nextCircuitState(await getHealth(context, provider.id), "success", circuitOptions(context)),
+      );
+      return;
+    }
+
+    if (status.status === "failed") {
+      if (status.retryable && (job.retryCount ?? 0) < context.config.maxRetryAttempts) {
+        const retrying = {
+          ...job,
+          status: "retrying",
+          currentStage: status.stage,
+          progress: status.progress,
+          retryCount: job.retryCount + 1,
+        } satisfies StoredJob;
+        await updateJob(context, retrying);
+        await schedulePoll(context, retrying);
+        return;
+      }
+      await failJob(context, job, new PublicApiError(status.errorCode ?? "conversion_failed", 400));
+      return;
+    }
+
+    const updated = {
+      ...job,
+      status: status.status === "retrying" ? "retrying" : "processing",
+      progress: status.progress,
+      currentStage: status.stage,
+      pollAttemptCount: job.pollAttemptCount + 1,
+    } satisfies StoredJob;
+    await updateJob(context, updated);
+    await schedulePoll(context, updated);
+  } catch (error) {
+    const publicError = toPublicError(error);
+    if (isRetryableError(publicError.code) && job.retryCount < context.config.maxRetryAttempts) {
+      const retrying = {
+        ...job,
+        status: "retrying",
+        currentStage: "provider retry scheduled",
+        retryCount: job.retryCount + 1,
+        pollAttemptCount: job.pollAttemptCount + 1,
+      } satisfies StoredJob;
+      await updateJob(context, retrying);
+      await schedulePoll(context, retrying);
+      return;
+    }
+    await failJob(context, job, error);
+  }
+};
+
+export const cancelStoredJob = async (
+  job: StoredJob,
+  context: RequestContext,
+): Promise<StoredJob> => {
   if (terminalStatuses.has(job.status)) return job;
   if (job.providerId && job.providerJobId) {
     const provider = getProviders(context.config).find(
@@ -232,18 +391,25 @@ export const cancelJob = async (publicId: string, context: RequestContext): Prom
     progress: 100,
     currentStage: "cancelled",
     cancellationState: "confirmed",
+    nextPollAt: undefined,
   } satisfies StoredJob;
   await updateJob(context, cancelled);
   await addEvent(context, cancelled, "conversion.cancelled", "Conversion job cancelled.");
-  await deliverClientWebhook(context, cancelled, "conversion.cancelled");
+  await queueClientWebhook(context, cancelled, "conversion.cancelled");
   return cancelled;
 };
 
 export const refreshDownload = async (
-  publicId: string,
+  job: StoredJob,
+  context: RequestContext,
+): Promise<StoredJob> => refreshDownloadByInternalId(job.id, context);
+
+export const refreshDownloadByInternalId = async (
+  jobId: string,
   context: RequestContext,
 ): Promise<StoredJob> => {
-  const job = await getExistingJob(publicId, context);
+  const job = await context.repository.getJobById(jobId);
+  if (!job) throw new PublicApiError("not_found", 404);
   if (job.status !== "completed" || !job.providerId || !job.providerJobId) {
     throw new PublicApiError("output_unavailable", 400);
   }
@@ -256,16 +422,25 @@ export const refreshDownload = async (
     deadlineMs: Date.now() + 10000,
     fetcher: context.fetcher,
   });
-  validateExternalUrl(download.url, "output_unavailable");
+  await validateProviderDownload(download, context);
   const updated = {
     ...job,
     outputUrl: redactUrl(download.url),
+    outputUrlPrivate: download.url,
+    outputUrlRedacted: redactUrl(download.url),
     outputUrlExpiresAt: download.expiresAt,
     outputMimeType: download.mimeType,
     outputFileSize: download.fileSize,
   } satisfies StoredJob;
   await updateJob(context, updated);
   return updated;
+};
+
+export const getDownloadForJob = (job: StoredJob): { url: string; expiresAt?: string } => {
+  if (job.status !== "completed" || !job.outputUrlPrivate) {
+    throw new PublicApiError("output_unavailable", 404);
+  }
+  return { url: job.outputUrlPrivate, expiresAt: job.outputUrlExpiresAt };
 };
 
 export const handleProviderWebhook = async (
@@ -288,23 +463,13 @@ export const handleProviderWebhook = async (
 
   const activeJobs = await context.repository.listActiveJobs();
   const job = activeJobs.find((candidate) => candidate.providerJobId === event.providerJobId);
-  if (!job) return undefined;
+  if (!job || terminalStatuses.has(job.status)) return job;
   if (event.status === "completed" && event.download) {
     return completeJob(context, job, event.download);
   }
   if (event.status === "failed") {
-    const failed = {
-      ...job,
-      status: "failed",
-      progress: 100,
-      currentStage: "failed",
-      publicErrorCode: "conversion_failed",
-      publicErrorMessage: publicErrorCatalog.conversion_failed.message,
-    } satisfies StoredJob;
-    await updateJob(context, failed);
-    await addEvent(context, failed, "conversion.failed", "Provider reported failure.");
-    await deliverClientWebhook(context, failed, "conversion.failed");
-    return failed;
+    await failJob(context, job, new PublicApiError("conversion_failed", 400));
+    return (await context.repository.getJobById(job.id)) ?? job;
   }
   const updated = {
     ...job,
@@ -318,36 +483,69 @@ export const handleProviderWebhook = async (
 
 export const reconcileJobs = async (
   context: RequestContext,
-): Promise<{ processed: number; expired: number }> => {
-  const before = new Date(
-    Date.now() - context.config.staleJobThresholdMinutes * 60 * 1000,
-  ).toISOString();
-  const stuck = await context.repository.listStuckJobs(before);
+): Promise<{ processed: number; expired: number; webhooks: number }> => {
+  const now = new Date().toISOString();
   let processed = 0;
   let expired = 0;
-  for (const job of stuck) {
-    if (new Date(job.expiresAt) < new Date()) {
-      const expiredJob = {
-        ...job,
-        status: "expired",
-        progress: 100,
-        currentStage: "expired",
-        publicErrorCode: "source_expired",
-        publicErrorMessage: publicErrorCatalog.source_expired.message,
-      } satisfies StoredJob;
-      await updateJob(context, expiredJob);
-      await addEvent(context, expiredJob, "conversion.expired", "Conversion job expired.");
-      await deliverClientWebhook(context, expiredJob, "conversion.expired");
+  let webhooks = 0;
+
+  const dueTasks = await context.repository.claimDueScheduledTasks(now, 50);
+  for (const task of dueTasks) {
+    try {
+      await processQueuePayload(task.payload, context);
+      await context.repository.completeScheduledTask(task.dedupeKey);
+      processed += 1;
+    } catch (error) {
+      await context.repository.failScheduledTask(task.dedupeKey, sanitizeDiagnostic(error));
+      const publicError = toPublicError(error);
+      if (!publicError.retryable) processed += 1;
+    }
+  }
+
+  const activeJobs = await context.repository.listActiveJobs();
+  for (const job of activeJobs) {
+    if (new Date(job.expiresAt) <= new Date()) {
+      await expireJob(context, job);
       expired += 1;
-    } else {
-      await processConversionJob(job.id, context);
+      continue;
+    }
+    if (job.nextPollAt && job.nextPollAt <= now) {
+      await enqueueStage(context, {
+        kind: "poll_provider_job",
+        jobId: job.id,
+        requestId: context.requestId,
+        dedupeKey: `${job.id}:poll_provider_job:${job.pollAttemptCount}`,
+      });
       processed += 1;
     }
   }
-  return { processed, expired };
+
+  const dueWebhookEvents = await context.repository.listDueClientWebhookEvents(now, 50);
+  for (const event of dueWebhookEvents) {
+    await enqueueStage(context, {
+      kind: "deliver_client_webhook",
+      jobId: event.jobId,
+      requestId: context.requestId,
+      dedupeKey: `${event.jobId}:deliver_client_webhook:${event.eventId}:${event.attemptCount}`,
+      webhookEventId: event.eventId,
+    });
+    webhooks += 1;
+  }
+
+  return { processed, expired, webhooks };
 };
 
-export const toPublicJob = (job: StoredJob): PublicJob => ({
+export const getAuthorizedJob = async (
+  request: Request,
+  publicId: string,
+  context: RequestContext,
+): Promise<StoredJob> => {
+  const job = await getExistingJob(publicId, context);
+  await assertJobAccess(request, job, context);
+  return job;
+};
+
+export const toPublicJob = (job: StoredJob, includeDownloadUrl = false): PublicJob => ({
   jobId: job.publicId,
   status: job.status,
   progress: job.progress,
@@ -360,7 +558,7 @@ export const toPublicJob = (job: StoredJob): PublicJob => ({
   updatedAt: job.updatedAt,
   expiresAt: job.expiresAt,
   completedAt: job.completedAt,
-  outputUrl: job.outputUrl,
+  outputUrl: includeDownloadUrl ? job.outputUrlPrivate : undefined,
   outputUrlExpiresAt: job.outputUrlExpiresAt,
   outputMimeType: job.outputMimeType,
   outputFileSize: job.outputFileSize,
@@ -382,64 +580,15 @@ export const getExistingJob = async (
   return job;
 };
 
-const submitToProvider = async (
-  provider: ConversionProvider,
-  job: StoredJob,
+const schedulePoll = async (
   context: RequestContext,
-) =>
-  provider.createJob(
-    {
-      jobId: job.id,
-      idempotencyKey: job.idempotencyKey,
-      sourceUrl: job.inputUrl,
-      format: job.format,
-      quality: job.quality,
-      callbackUrl: job.callbackUrl,
-    },
-    {
-      requestId: context.requestId,
-      deadlineMs: Date.now() + context.config.genericProvider.timeoutMs,
-      fetcher: context.fetcher,
-    },
-  );
-
-const pollProviderToTerminal = async (
-  provider: ConversionProvider,
   job: StoredJob,
-  context: RequestContext,
-): Promise<{ providerJobId: string }> => {
-  if (!job.providerJobId) throw new PublicApiError("provider_temporary_failure", 502);
-  let current = job;
-  for (let attempt = 1; attempt <= context.config.maxRetryAttempts + 1; attempt += 1) {
-    const status = await provider.getJobStatus(job.providerJobId, {
-      requestId: context.requestId,
-      deadlineMs: Date.now() + context.config.genericProvider.timeoutMs,
-      fetcher: context.fetcher,
-    });
-
-    if (status.status === "completed" && status.download) {
-      await completeJob(context, current, status.download);
-      return { providerJobId: status.providerJobId };
-    }
-
-    if (status.status === "failed") {
-      throw new PublicApiError(
-        status.errorCode ?? "conversion_failed",
-        status.retryable ? 503 : 400,
-      );
-    }
-
-    current = {
-      ...current,
-      status: status.status === "retrying" ? "retrying" : "processing",
-      progress: status.progress,
-      currentStage: status.stage,
-      retryCount: status.status === "retrying" ? current.retryCount + 1 : current.retryCount,
-    };
-    await updateJob(context, current);
-
-    const delay = calculateBackoffMs(
-      attempt,
+  explicitDelayMs?: number,
+): Promise<void> => {
+  const delayMs =
+    explicitDelayMs ??
+    calculateBackoffMs(
+      Math.max(1, job.pollAttemptCount + 1),
       {
         initialDelayMs: context.config.initialRetryDelayMs,
         maxDelayMs: context.config.maxRetryDelayMs,
@@ -448,39 +597,269 @@ const pollProviderToTerminal = async (
       },
       () => 0,
     );
-    if (delay > 0 && context.config.appEnv === "production") {
-      await new Promise((resolve) => setTimeout(resolve, Math.min(delay, 1000)));
+  const nextPollAt = new Date(Date.now() + delayMs).toISOString();
+  await updateJob(context, { ...job, nextPollAt });
+  await enqueueStage(
+    context,
+    {
+      kind: "poll_provider_job",
+      jobId: job.id,
+      requestId: context.requestId,
+      dedupeKey: `${job.id}:poll_provider_job:${job.pollAttemptCount + 1}`,
+    },
+    nextPollAt,
+  );
+};
+
+const enqueueStage = async (
+  context: RequestContext,
+  payload: QueuePayload,
+  runAt = new Date().toISOString(),
+): Promise<void> => {
+  const task: ScheduledTask = {
+    id: randomId("task", 20),
+    kind: payload.kind,
+    jobId: payload.jobId,
+    payload,
+    runAt,
+    status: "pending",
+    attempts: 0,
+    dedupeKey: payload.dedupeKey,
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+  };
+  await context.repository.scheduleTask(task);
+
+  if (context.env.CONVERSION_QUEUE) {
+    const delaySeconds = Math.max(0, Math.ceil((new Date(runAt).getTime() - Date.now()) / 1000));
+    if (delaySeconds <= 43_200) {
+      if (delaySeconds > 0) {
+        await context.env.CONVERSION_QUEUE.send(payload, { delaySeconds });
+      } else {
+        await context.env.CONVERSION_QUEUE.send(payload);
+      }
     }
+    return;
   }
 
-  throw new PublicApiError(
-    "provider_temporary_failure",
-    503,
-    "Provider did not reach terminal state",
-  );
+  if (runAt <= new Date().toISOString()) {
+    await processQueuePayload(payload, context);
+    await context.repository.completeScheduledTask(payload.dedupeKey);
+  }
+};
+
+const queueClientWebhook = async (
+  context: RequestContext,
+  job: StoredJob,
+  eventType: string,
+): Promise<void> => {
+  if (!job.callbackUrlPrivate) return;
+  const eventId = randomId("evt", 20);
+  const event: ClientWebhookEvent = {
+    id: randomId("cwe", 20),
+    jobId: job.id,
+    eventId,
+    eventType,
+    payloadJson: JSON.stringify({
+      id: eventId,
+      type: eventType,
+      createdAt: new Date().toISOString(),
+      data: toPublicJob(job, false),
+    }),
+    callbackUrlPrivate: job.callbackUrlPrivate,
+    callbackUrlRedacted: job.callbackUrlRedacted ?? redactUrl(job.callbackUrlPrivate),
+    status: "pending",
+    attemptCount: 0,
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+  };
+  await context.repository.createClientWebhookEvent(event);
+  await enqueueStage(context, {
+    kind: "deliver_client_webhook",
+    jobId: job.id,
+    requestId: context.requestId,
+    dedupeKey: `${job.id}:deliver_client_webhook:${event.eventId}:0`,
+    webhookEventId: event.eventId,
+  });
+};
+
+const processClientWebhookDelivery = async (
+  eventId: string,
+  context: RequestContext,
+): Promise<void> => {
+  const event = await context.repository.getClientWebhookEvent(eventId);
+  if (!event || event.status === "delivered" || event.status === "permanently_failed") return;
+  if (event.status === "delivering") return;
+
+  const delivering = {
+    ...event,
+    status: "delivering" as const,
+    attemptCount: event.attemptCount + 1,
+    updatedAt: new Date().toISOString(),
+  };
+  await context.repository.updateClientWebhookEvent(delivering);
+
+  let statusCode: number | undefined;
+  let nextStatus: ClientWebhookEvent["status"] = "delivered";
+  let lastError: string | undefined;
+  try {
+    const signed = await signWebhookPayload(
+      context.config.clientWebhookSigningSecret,
+      event.payloadJson,
+      Math.floor(Date.now() / 1000).toString(),
+      event.eventId,
+    );
+    const response = await context.fetcher(event.callbackUrlPrivate, {
+      method: "POST",
+      headers: clientWebhookHeaders(signed),
+      body: event.payloadJson,
+    });
+    statusCode = response.status;
+    if (!response.ok) {
+      nextStatus = shouldRetryWebhookStatus(response.status, delivering.attemptCount, context)
+        ? "retrying"
+        : "permanently_failed";
+      lastError = `HTTP ${response.status}`;
+    }
+  } catch (error) {
+    nextStatus =
+      delivering.attemptCount < context.config.clientWebhookMaxAttempts
+        ? "retrying"
+        : "permanently_failed";
+    lastError = sanitizeDiagnostic(error);
+  }
+
+  const nextAttemptAt =
+    nextStatus === "retrying"
+      ? new Date(
+          Date.now() +
+            calculateBackoffMs(
+              delivering.attemptCount,
+              {
+                initialDelayMs: context.config.initialRetryDelayMs,
+                maxDelayMs: context.config.maxRetryDelayMs,
+                maxAttempts: context.config.clientWebhookMaxAttempts,
+                jitterRatio: 0.2,
+              },
+              () => 0,
+            ),
+        ).toISOString()
+      : undefined;
+
+  const updated: ClientWebhookEvent = {
+    ...delivering,
+    status: nextStatus,
+    lastStatusCode: statusCode,
+    lastError,
+    nextAttemptAt,
+    updatedAt: new Date().toISOString(),
+  };
+  await context.repository.updateClientWebhookEvent(updated);
+  await context.repository.recordClientWebhookDelivery({
+    id: randomId("cwd", 20),
+    jobId: event.jobId,
+    eventId: event.eventId,
+    eventType: event.eventType,
+    callbackUrlRedacted: event.callbackUrlRedacted,
+    status: nextStatus,
+    attemptCount: updated.attemptCount,
+    lastStatusCode: statusCode,
+    nextAttemptAt,
+    createdAt: event.createdAt,
+    updatedAt: updated.updatedAt,
+  });
+
+  if (nextStatus === "retrying" && nextAttemptAt) {
+    await enqueueStage(
+      context,
+      {
+        kind: "deliver_client_webhook",
+        jobId: event.jobId,
+        requestId: context.requestId,
+        dedupeKey: `${event.jobId}:deliver_client_webhook:${event.eventId}:${updated.attemptCount}`,
+        webhookEventId: event.eventId,
+      },
+      nextAttemptAt,
+    );
+  }
 };
 
 const completeJob = async (
   context: RequestContext,
   job: StoredJob,
-  download: { url: string; expiresAt?: string; mimeType?: string; fileSize?: number },
+  download: ProviderDownloadResult,
 ): Promise<StoredJob> => {
-  const safeOutput = validateExternalUrl(download.url, "output_unavailable");
+  await validateProviderDownload(download, context);
   const completed = {
     ...job,
     status: "completed",
     progress: 100,
     currentStage: "completed",
     completedAt: new Date().toISOString(),
-    outputUrl: safeOutput.redactedUrl,
+    nextPollAt: undefined,
+    outputUrl: redactUrl(download.url),
+    outputUrlPrivate: download.url,
+    outputUrlRedacted: redactUrl(download.url),
     outputUrlExpiresAt: download.expiresAt,
     outputMimeType: download.mimeType,
     outputFileSize: download.fileSize,
   } satisfies StoredJob;
   await updateJob(context, completed);
   await addEvent(context, completed, "conversion.completed", "Conversion completed.");
-  await deliverClientWebhook(context, completed, "conversion.completed");
+  await queueClientWebhook(context, completed, "conversion.completed");
   return completed;
+};
+
+const validateProviderDownload = async (
+  download: ProviderDownloadResult,
+  context: RequestContext,
+): Promise<void> => {
+  validateExternalUrl(download.url, "output_unavailable");
+  await validateRedirectChain(download.url, {
+    fetcher: context.fetcher,
+    maxRedirects: 3,
+    expectedContentTypes: download.mimeType ? [download.mimeType] : undefined,
+  });
+};
+
+const failJob = async (context: RequestContext, job: StoredJob, error: unknown): Promise<void> => {
+  const publicError = toPublicError(error);
+  const failed = {
+    ...job,
+    status: "failed",
+    progress: 100,
+    currentStage: "failed",
+    nextPollAt: undefined,
+    publicErrorCode: publicError.code,
+    publicErrorMessage: publicError.message,
+    internalDiagnostic: sanitizeDiagnostic(error),
+  } satisfies StoredJob;
+  await updateJob(context, failed);
+  await addEvent(context, failed, "conversion.failed", publicError.message);
+  await queueClientWebhook(context, failed, "conversion.failed");
+};
+
+const expireJob = async (context: RequestContext, job: StoredJob): Promise<void> => {
+  const expiredJob = {
+    ...job,
+    status: "expired",
+    progress: 100,
+    currentStage: "expired",
+    nextPollAt: undefined,
+    publicErrorCode: "source_expired",
+    publicErrorMessage: publicErrorCatalog.source_expired.message,
+  } satisfies StoredJob;
+  await updateJob(context, expiredJob);
+  await addEvent(context, expiredJob, "conversion.expired", "Conversion job expired.");
+  await queueClientWebhook(context, expiredJob, "conversion.expired");
+};
+
+const reconcileOneJob = async (jobId: string, context: RequestContext): Promise<void> => {
+  const job = await context.repository.getJobById(jobId);
+  if (!job || terminalStatuses.has(job.status)) return;
+  if (new Date(job.expiresAt) <= new Date()) await expireJob(context, job);
+  else if (job.providerJobId) await pollProviderJob(job.id, context);
+  else await submitProviderJob(job.id, context);
 };
 
 const updateJob = async (context: RequestContext, job: StoredJob): Promise<void> => {
@@ -516,6 +895,84 @@ const startAttempt = (job: StoredJob, providerId: string): StoredProviderAttempt
   startedAt: new Date().toISOString(),
 });
 
+const validateCallbackUrl = (
+  rawUrl: string,
+  context: RequestContext,
+): ReturnType<typeof validateExternalUrl> => {
+  const callback = validateExternalUrl(rawUrl, "invalid_source_url");
+  if (
+    context.config.callbackHostAllowlist.length &&
+    !context.config.callbackHostAllowlist.includes(callback.hostname)
+  ) {
+    throw new PublicApiError("invalid_source_url", 400, "Callback host is not allowlisted");
+  }
+  return callback;
+};
+
+const assertSupportedRequest = (
+  input: ConversionRequest,
+  capabilities: CapabilitiesResponse,
+): void => {
+  if (!capabilities.formats.includes(input.format)) {
+    throw new PublicApiError("unsupported_format", 400);
+  }
+  if (!capabilities.qualities.includes(input.quality)) {
+    throw new PublicApiError("unsupported_quality", 400);
+  }
+  const maxInputUrlLength = Math.min(
+    ...capabilities.providers.map((provider) => provider.capabilities.maxInputUrlLength),
+  );
+  if (input.url.length > maxInputUrlLength) {
+    throw new PublicApiError("invalid_source_url", 400, "Input URL exceeds provider limit");
+  }
+};
+
+const providerSupportsJob = (capabilities: ProviderCapabilities, job: StoredJob): boolean =>
+  capabilities.formats.includes(job.format) && capabilities.qualities.includes(job.quality);
+
+const assertJobAccess = async (
+  request: Request,
+  job: StoredJob,
+  context: RequestContext,
+): Promise<void> => {
+  if (job.apiKeyId) {
+    const principal = await authenticateApiKey(request, context);
+    if (principal.apiKey.id !== job.apiKeyId) {
+      throw new PublicApiError("forbidden", 403, "API key does not own this job");
+    }
+    return;
+  }
+
+  const token = readJobAccessToken(request);
+  if (!token || !job.accessTokenHash) {
+    throw new PublicApiError("unauthorized", 401, "Job access token required");
+  }
+  const hash = await hashApiKey(token, context.config.apiKeyHashSecret);
+  if (!timingSafeEqual(hash, job.accessTokenHash)) {
+    throw new PublicApiError("forbidden", 403, "Invalid job access token");
+  }
+};
+
+const readJobAccessToken = (request: Request): string | undefined => {
+  const explicit = request.headers.get("EliteConverter-Job-Token");
+  if (explicit) return explicit;
+  const authorization = request.headers.get("authorization") ?? "";
+  const [scheme, value] = authorization.split(/\s+/, 2);
+  if (scheme?.toLowerCase() === "bearer" && value?.startsWith("ec_access_")) return value;
+  try {
+    return new URL(request.url).searchParams.get("access_token") ?? undefined;
+  } catch {
+    return undefined;
+  }
+};
+
+const probeHealth = async (context: RequestContext, providerId: string) => {
+  const health = await getHealth(context, providerId);
+  const probed = nextCircuitState(health, "probe", circuitOptions(context));
+  await context.repository.setProviderHealth(probed);
+  return probed;
+};
+
 const getHealth = async (context: RequestContext, providerId: string) =>
   (await context.repository.getProviderHealth(providerId)) ?? {
     providerId,
@@ -526,43 +983,21 @@ const getHealth = async (context: RequestContext, providerId: string) =>
     updatedAt: new Date().toISOString(),
   };
 
-const deliverClientWebhook = async (
+const circuitOptions = (context: RequestContext) => ({
+  threshold: context.config.circuitBreakerThreshold,
+  cooldownSeconds: context.config.circuitBreakerCooldownSeconds,
+});
+
+const shouldRetryWebhookStatus = (
+  status: number,
+  attemptCount: number,
   context: RequestContext,
-  job: StoredJob,
-  eventType: string,
-): Promise<void> => {
-  if (!job.callbackUrl) return;
-  const payload = JSON.stringify({
-    id: randomId("evt", 20),
-    type: eventType,
-    createdAt: new Date().toISOString(),
-    data: toPublicJob(job),
-  });
-  const signed = await signWebhookPayload(context.config.clientWebhookSigningSecret, payload);
-  let status: string;
-  let statusCode: number | undefined;
-  try {
-    const response = await context.fetcher(job.callbackUrl, {
-      method: "POST",
-      headers: clientWebhookHeaders(signed),
-      body: payload,
-    });
-    statusCode = response.status;
-    status = response.ok ? "delivered" : response.status >= 500 ? "retrying" : "failed";
-  } catch {
-    status = "retrying";
-  }
-  await context.repository.recordClientWebhookDelivery({
-    id: randomId("cwd", 20),
-    jobId: job.id,
-    eventId: signed.eventId,
-    eventType,
-    callbackUrlRedacted: redactUrl(job.callbackUrl),
-    status,
-    attemptCount: 1,
-    lastStatusCode: statusCode,
-    nextAttemptAt: status === "retrying" ? new Date(Date.now() + 60_000).toISOString() : undefined,
-    createdAt: new Date().toISOString(),
-    updatedAt: new Date().toISOString(),
-  });
+): boolean =>
+  attemptCount < context.config.clientWebhookMaxAttempts &&
+  (status >= 500 || retryableWebhookStatuses.has(status));
+
+const intersectCapabilities = <T extends OutputFormat | QualityOption>(values: T[][]): T[] => {
+  const [first, ...rest] = values;
+  if (!first) return [];
+  return first.filter((item) => rest.every((list) => list.includes(item)));
 };

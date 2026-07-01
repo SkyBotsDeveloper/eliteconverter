@@ -1,5 +1,13 @@
 import type { CircuitBreakerSnapshot, JobEvent, PublicErrorCode } from "@eliteconverter/shared";
-import type { Env, StoredApiKey, StoredIncident, StoredJob, StoredProviderAttempt } from "./types";
+import type {
+  ClientWebhookEvent,
+  Env,
+  ScheduledTask,
+  StoredApiKey,
+  StoredIncident,
+  StoredJob,
+  StoredProviderAttempt,
+} from "./types";
 
 export interface Repository {
   insertApiKey(key: StoredApiKey): Promise<void>;
@@ -7,6 +15,12 @@ export interface Repository {
   updateApiKeyLastUsed(id: string, at: string): Promise<void>;
   revokeApiKey(id: string, at: string): Promise<void>;
   insertJob(job: StoredJob): Promise<void>;
+  createJobWithIdempotency(input: {
+    job: StoredJob;
+    scope: string;
+    idempotencyKey?: string;
+    fingerprint: string;
+  }): Promise<{ job: StoredJob; existing: boolean }>;
   updateJob(job: StoredJob): Promise<void>;
   getJobById(id: string): Promise<StoredJob | undefined>;
   getJobByPublicId(publicId: string): Promise<StoredJob | undefined>;
@@ -43,6 +57,17 @@ export interface Repository {
     createdAt: string;
     updatedAt: string;
   }): Promise<void>;
+  createClientWebhookEvent(event: ClientWebhookEvent): Promise<void>;
+  getClientWebhookEvent(eventId: string): Promise<ClientWebhookEvent | undefined>;
+  listClientWebhookEventsForJob(jobId: string): Promise<ClientWebhookEvent[]>;
+  updateClientWebhookEvent(event: ClientWebhookEvent): Promise<void>;
+  listDueClientWebhookEvents(now: string, limit: number): Promise<ClientWebhookEvent[]>;
+  scheduleTask(task: ScheduledTask): Promise<void>;
+  claimDueScheduledTasks(now: string, limit: number): Promise<ScheduledTask[]>;
+  completeScheduledTask(dedupeKey: string): Promise<void>;
+  failScheduledTask(dedupeKey: string, error: string): Promise<void>;
+  hasProcessedQueueDelivery(dedupeKey: string): Promise<boolean>;
+  markQueueDeliveryProcessed(dedupeKey: string): Promise<void>;
   listActiveJobs(): Promise<StoredJob[]>;
   listStuckJobs(before: string): Promise<StoredJob[]>;
   listIncidents(): Promise<StoredIncident[]>;
@@ -58,6 +83,9 @@ export class MemoryRepository implements Repository {
   private readonly idempotency = new Map<string, { fingerprint: string; jobId: string }>();
   private readonly providerHealth = new Map<string, CircuitBreakerSnapshot>();
   private readonly providerWebhookEvents = new Set<string>();
+  private readonly clientWebhookEvents = new Map<string, ClientWebhookEvent>();
+  private readonly scheduledTasks = new Map<string, ScheduledTask>();
+  private readonly processedQueueDeliveries = new Set<string>();
   private readonly incidents = new Map<string, StoredIncident>();
 
   async insertApiKey(key: StoredApiKey): Promise<void> {
@@ -83,6 +111,27 @@ export class MemoryRepository implements Repository {
   async insertJob(job: StoredJob): Promise<void> {
     this.jobs.set(job.id, job);
     this.publicJobIndex.set(job.publicId, job.id);
+  }
+
+  async createJobWithIdempotency(input: {
+    job: StoredJob;
+    scope: string;
+    idempotencyKey?: string;
+    fingerprint: string;
+  }): Promise<{ job: StoredJob; existing: boolean }> {
+    if (!input.idempotencyKey) {
+      await this.insertJob(input.job);
+      return { job: input.job, existing: false };
+    }
+    const key = `${input.scope}:${input.idempotencyKey}`;
+    const existing = this.idempotency.get(key);
+    if (existing) {
+      const job = this.jobs.get(existing.jobId);
+      if (job) return { job, existing: true };
+    }
+    this.idempotency.set(key, { fingerprint: input.fingerprint, jobId: input.job.id });
+    await this.insertJob(input.job);
+    return { job: input.job, existing: false };
   }
 
   async updateJob(job: StoredJob): Promise<void> {
@@ -149,6 +198,85 @@ export class MemoryRepository implements Repository {
 
   async recordClientWebhookDelivery(): Promise<void> {
     return;
+  }
+
+  async createClientWebhookEvent(event: ClientWebhookEvent): Promise<void> {
+    if (!this.clientWebhookEvents.has(event.eventId)) {
+      this.clientWebhookEvents.set(event.eventId, event);
+    }
+  }
+
+  async getClientWebhookEvent(eventId: string): Promise<ClientWebhookEvent | undefined> {
+    return this.clientWebhookEvents.get(eventId);
+  }
+
+  async listClientWebhookEventsForJob(jobId: string): Promise<ClientWebhookEvent[]> {
+    return [...this.clientWebhookEvents.values()].filter((event) => event.jobId === jobId);
+  }
+
+  async updateClientWebhookEvent(event: ClientWebhookEvent): Promise<void> {
+    this.clientWebhookEvents.set(event.eventId, event);
+  }
+
+  async listDueClientWebhookEvents(now: string, limit: number): Promise<ClientWebhookEvent[]> {
+    return [...this.clientWebhookEvents.values()]
+      .filter(
+        (event) =>
+          (event.status === "pending" || event.status === "retrying") &&
+          (!event.nextAttemptAt || event.nextAttemptAt <= now),
+      )
+      .slice(0, limit);
+  }
+
+  async scheduleTask(task: ScheduledTask): Promise<void> {
+    if (!this.scheduledTasks.has(task.dedupeKey)) this.scheduledTasks.set(task.dedupeKey, task);
+  }
+
+  async claimDueScheduledTasks(now: string, limit: number): Promise<ScheduledTask[]> {
+    const due = [...this.scheduledTasks.values()]
+      .filter((task) => task.status === "pending" && task.runAt <= now)
+      .sort((left, right) => left.runAt.localeCompare(right.runAt))
+      .slice(0, limit);
+    for (const task of due) {
+      this.scheduledTasks.set(task.dedupeKey, {
+        ...task,
+        status: "processing",
+        attempts: task.attempts + 1,
+        updatedAt: now,
+      });
+    }
+    return due;
+  }
+
+  async completeScheduledTask(dedupeKey: string): Promise<void> {
+    const task = this.scheduledTasks.get(dedupeKey);
+    if (task)
+      this.scheduledTasks.set(dedupeKey, {
+        ...task,
+        status: "completed",
+        updatedAt: new Date().toISOString(),
+      });
+  }
+
+  async failScheduledTask(dedupeKey: string, error: string): Promise<void> {
+    const task = this.scheduledTasks.get(dedupeKey);
+    if (task) {
+      this.scheduledTasks.set(dedupeKey, {
+        ...task,
+        status: "pending",
+        lastError: error,
+        runAt: new Date(Date.now() + 60_000).toISOString(),
+        updatedAt: new Date().toISOString(),
+      });
+    }
+  }
+
+  async hasProcessedQueueDelivery(dedupeKey: string): Promise<boolean> {
+    return this.processedQueueDeliveries.has(dedupeKey);
+  }
+
+  async markQueueDeliveryProcessed(dedupeKey: string): Promise<void> {
+    this.processedQueueDeliveries.add(dedupeKey);
   }
 
   async listActiveJobs(): Promise<StoredJob[]> {
@@ -232,11 +360,62 @@ export class D1Repository implements Repository {
           current_stage, provider_id, provider_job_id, retry_count, provider_attempt_count,
           public_error_code, public_error_message, internal_diagnostic, created_at, updated_at,
           expires_at, completed_at, output_url, output_url_expires_at, output_mime_type,
-          output_file_size, idempotency_key, request_fingerprint, callback_url, cancellation_state
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          output_file_size, idempotency_key, request_fingerprint, callback_url, cancellation_state,
+          access_token_hash, output_url_private, output_url_redacted, callback_url_private,
+          callback_url_redacted, next_poll_at, poll_attempt_count
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .bind(...jobValues(job))
       .run();
+  }
+
+  async createJobWithIdempotency(input: {
+    job: StoredJob;
+    scope: string;
+    idempotencyKey?: string;
+    fingerprint: string;
+  }): Promise<{ job: StoredJob; existing: boolean }> {
+    if (!input.idempotencyKey) {
+      await this.insertJob(input.job);
+      return { job: input.job, existing: false };
+    }
+    const existing = await this.findJobByIdempotency(input.scope, input.idempotencyKey);
+    if (existing) return { job: existing, existing: true };
+    try {
+      await this.db.batch([
+        this.db
+          .prepare(
+            "INSERT INTO idempotency_records (id, scope, idempotency_key, request_fingerprint, job_id, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+          )
+          .bind(
+            crypto.randomUUID(),
+            input.scope,
+            input.idempotencyKey,
+            input.fingerprint,
+            input.job.id,
+            new Date().toISOString(),
+          ),
+        this.db
+          .prepare(
+            `INSERT INTO conversion_jobs (
+              id, public_id, owner_id, anonymous_session_id, api_key_id, input_url,
+              input_url_redacted, source_hostname, format, quality, status, progress,
+              current_stage, provider_id, provider_job_id, retry_count, provider_attempt_count,
+              public_error_code, public_error_message, internal_diagnostic, created_at, updated_at,
+              expires_at, completed_at, output_url, output_url_expires_at, output_mime_type,
+              output_file_size, idempotency_key, request_fingerprint, callback_url, cancellation_state,
+              access_token_hash, output_url_private, output_url_redacted, callback_url_private,
+              callback_url_redacted, next_poll_at, poll_attempt_count
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          )
+          .bind(...jobValues(input.job)),
+      ]);
+      return { job: input.job, existing: false };
+    } catch {
+      const raced = await this.findJobByIdempotency(input.scope, input.idempotencyKey);
+      if (raced) return { job: raced, existing: true };
+      throw new Error("Failed to create idempotent job");
+    }
   }
 
   async updateJob(job: StoredJob): Promise<void> {
@@ -249,7 +428,10 @@ export class D1Repository implements Repository {
           provider_attempt_count = ?, public_error_code = ?, public_error_message = ?,
           internal_diagnostic = ?, updated_at = ?, expires_at = ?, completed_at = ?, output_url = ?,
           output_url_expires_at = ?, output_mime_type = ?, output_file_size = ?,
-          idempotency_key = ?, request_fingerprint = ?, callback_url = ?, cancellation_state = ?
+          idempotency_key = ?, request_fingerprint = ?, callback_url = ?, cancellation_state = ?,
+          access_token_hash = ?, output_url_private = ?, output_url_redacted = ?,
+          callback_url_private = ?, callback_url_redacted = ?, next_poll_at = ?,
+          poll_attempt_count = ?
           WHERE id = ?`,
       )
       .bind(...jobUpdateValues(job))
@@ -445,6 +627,147 @@ export class D1Repository implements Repository {
       .run();
   }
 
+  async createClientWebhookEvent(event: ClientWebhookEvent): Promise<void> {
+    await this.db
+      .prepare(
+        "INSERT OR IGNORE INTO client_webhook_events (id, job_id, event_id, event_type, payload_json, callback_url_private, callback_url_redacted, status, attempt_count, last_status_code, last_error, next_attempt_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+      )
+      .bind(
+        event.id,
+        event.jobId,
+        event.eventId,
+        event.eventType,
+        event.payloadJson,
+        event.callbackUrlPrivate,
+        event.callbackUrlRedacted,
+        event.status,
+        event.attemptCount,
+        event.lastStatusCode ?? null,
+        event.lastError ?? null,
+        event.nextAttemptAt ?? null,
+        event.createdAt,
+        event.updatedAt,
+      )
+      .run();
+  }
+
+  async getClientWebhookEvent(eventId: string): Promise<ClientWebhookEvent | undefined> {
+    const row = await this.db
+      .prepare("SELECT * FROM client_webhook_events WHERE event_id = ? LIMIT 1")
+      .bind(eventId)
+      .first<ClientWebhookEventRow>();
+    return row ? mapClientWebhookEvent(row) : undefined;
+  }
+
+  async listClientWebhookEventsForJob(jobId: string): Promise<ClientWebhookEvent[]> {
+    const { results } = await this.db
+      .prepare("SELECT * FROM client_webhook_events WHERE job_id = ? ORDER BY created_at ASC")
+      .bind(jobId)
+      .all<ClientWebhookEventRow>();
+    return results.map(mapClientWebhookEvent);
+  }
+
+  async updateClientWebhookEvent(event: ClientWebhookEvent): Promise<void> {
+    await this.db
+      .prepare(
+        "UPDATE client_webhook_events SET status = ?, attempt_count = ?, last_status_code = ?, last_error = ?, next_attempt_at = ?, updated_at = ? WHERE event_id = ?",
+      )
+      .bind(
+        event.status,
+        event.attemptCount,
+        event.lastStatusCode ?? null,
+        event.lastError ?? null,
+        event.nextAttemptAt ?? null,
+        event.updatedAt,
+        event.eventId,
+      )
+      .run();
+  }
+
+  async listDueClientWebhookEvents(now: string, limit: number): Promise<ClientWebhookEvent[]> {
+    const { results } = await this.db
+      .prepare(
+        "SELECT * FROM client_webhook_events WHERE status IN ('pending','retrying') AND (next_attempt_at IS NULL OR next_attempt_at <= ?) ORDER BY created_at ASC LIMIT ?",
+      )
+      .bind(now, limit)
+      .all<ClientWebhookEventRow>();
+    return results.map(mapClientWebhookEvent);
+  }
+
+  async scheduleTask(task: ScheduledTask): Promise<void> {
+    await this.db
+      .prepare(
+        "INSERT OR IGNORE INTO scheduled_tasks (id, kind, job_id, payload_json, run_at, status, attempts, dedupe_key, last_error, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+      )
+      .bind(
+        task.id,
+        task.kind,
+        task.jobId ?? null,
+        JSON.stringify(task.payload),
+        task.runAt,
+        task.status,
+        task.attempts,
+        task.dedupeKey,
+        task.lastError ?? null,
+        task.createdAt,
+        task.updatedAt,
+      )
+      .run();
+  }
+
+  async claimDueScheduledTasks(now: string, limit: number): Promise<ScheduledTask[]> {
+    const { results } = await this.db
+      .prepare(
+        "SELECT * FROM scheduled_tasks WHERE status = 'pending' AND run_at <= ? ORDER BY run_at ASC LIMIT ?",
+      )
+      .bind(now, limit)
+      .all<ScheduledTaskRow>();
+    for (const row of results) {
+      await this.db
+        .prepare(
+          "UPDATE scheduled_tasks SET status = 'processing', attempts = attempts + 1, updated_at = ? WHERE dedupe_key = ? AND status = 'pending'",
+        )
+        .bind(now, row.dedupe_key)
+        .run();
+    }
+    return results.map(mapScheduledTask);
+  }
+
+  async completeScheduledTask(dedupeKey: string): Promise<void> {
+    await this.db
+      .prepare(
+        "UPDATE scheduled_tasks SET status = 'completed', updated_at = ? WHERE dedupe_key = ?",
+      )
+      .bind(new Date().toISOString(), dedupeKey)
+      .run();
+  }
+
+  async failScheduledTask(dedupeKey: string, error: string): Promise<void> {
+    await this.db
+      .prepare(
+        "UPDATE scheduled_tasks SET status = 'pending', last_error = ?, run_at = ?, updated_at = ? WHERE dedupe_key = ?",
+      )
+      .bind(error, new Date(Date.now() + 60_000).toISOString(), new Date().toISOString(), dedupeKey)
+      .run();
+  }
+
+  async hasProcessedQueueDelivery(dedupeKey: string): Promise<boolean> {
+    const row = await this.db
+      .prepare("SELECT dedupe_key FROM queue_message_deliveries WHERE dedupe_key = ? LIMIT 1")
+      .bind(dedupeKey)
+      .first<{ dedupe_key: string }>();
+    return Boolean(row);
+  }
+
+  async markQueueDeliveryProcessed(dedupeKey: string): Promise<void> {
+    await this.db
+      .prepare(
+        "INSERT OR IGNORE INTO queue_message_deliveries (dedupe_key, processed_at) VALUES (?, ?)",
+      )
+      .bind(dedupeKey, new Date().toISOString())
+      .run();
+  }
+
   async listActiveJobs(): Promise<StoredJob[]> {
     const { results } = await this.db
       .prepare(
@@ -559,6 +882,44 @@ interface JobRow {
   request_fingerprint: string | null;
   callback_url: string | null;
   cancellation_state: string | null;
+  access_token_hash: string | null;
+  output_url_private: string | null;
+  output_url_redacted: string | null;
+  callback_url_private: string | null;
+  callback_url_redacted: string | null;
+  next_poll_at: string | null;
+  poll_attempt_count: number | null;
+}
+
+interface ScheduledTaskRow {
+  id: string;
+  kind: ScheduledTask["kind"];
+  job_id: string | null;
+  payload_json: string;
+  run_at: string;
+  status: ScheduledTask["status"];
+  attempts: number;
+  dedupe_key: string;
+  last_error: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+interface ClientWebhookEventRow {
+  id: string;
+  job_id: string;
+  event_id: string;
+  event_type: string;
+  payload_json: string;
+  callback_url_private: string;
+  callback_url_redacted: string;
+  status: ClientWebhookEvent["status"];
+  attempt_count: number;
+  last_status_code: number | null;
+  last_error: string | null;
+  next_attempt_at: string | null;
+  created_at: string;
+  updated_at: string;
 }
 
 interface JobEventRow {
@@ -631,13 +992,20 @@ const mapJob = (row: JobRow): StoredJob => ({
   expiresAt: row.expires_at,
   completedAt: row.completed_at ?? undefined,
   outputUrl: row.output_url ?? undefined,
+  outputUrlPrivate: row.output_url_private ?? row.output_url ?? undefined,
+  outputUrlRedacted: row.output_url_redacted ?? row.output_url ?? undefined,
   outputUrlExpiresAt: row.output_url_expires_at ?? undefined,
   outputMimeType: row.output_mime_type ?? undefined,
   outputFileSize: row.output_file_size ?? undefined,
+  accessTokenHash: row.access_token_hash ?? undefined,
   idempotencyKey: row.idempotency_key ?? undefined,
   requestFingerprint: row.request_fingerprint ?? undefined,
   callbackUrl: row.callback_url ?? undefined,
+  callbackUrlPrivate: row.callback_url_private ?? row.callback_url ?? undefined,
+  callbackUrlRedacted: row.callback_url_redacted ?? undefined,
   cancellationState: row.cancellation_state ?? undefined,
+  nextPollAt: row.next_poll_at ?? undefined,
+  pollAttemptCount: row.poll_attempt_count ?? 0,
 });
 
 const mapJobEvent = (row: JobEventRow): JobEvent => ({
@@ -669,6 +1037,37 @@ const mapIncident = (row: IncidentRow): StoredIncident => ({
   createdAt: row.created_at,
   updatedAt: row.updated_at,
   resolvedAt: row.resolved_at ?? undefined,
+});
+
+const mapScheduledTask = (row: ScheduledTaskRow): ScheduledTask => ({
+  id: row.id,
+  kind: row.kind,
+  jobId: row.job_id ?? undefined,
+  payload: JSON.parse(row.payload_json) as ScheduledTask["payload"],
+  runAt: row.run_at,
+  status: row.status,
+  attempts: row.attempts,
+  dedupeKey: row.dedupe_key,
+  lastError: row.last_error ?? undefined,
+  createdAt: row.created_at,
+  updatedAt: row.updated_at,
+});
+
+const mapClientWebhookEvent = (row: ClientWebhookEventRow): ClientWebhookEvent => ({
+  id: row.id,
+  jobId: row.job_id,
+  eventId: row.event_id,
+  eventType: row.event_type,
+  payloadJson: row.payload_json,
+  callbackUrlPrivate: row.callback_url_private,
+  callbackUrlRedacted: row.callback_url_redacted,
+  status: row.status,
+  attemptCount: row.attempt_count,
+  lastStatusCode: row.last_status_code ?? undefined,
+  lastError: row.last_error ?? undefined,
+  nextAttemptAt: row.next_attempt_at ?? undefined,
+  createdAt: row.created_at,
+  updatedAt: row.updated_at,
 });
 
 const jobValues = (job: StoredJob): unknown[] => [
@@ -704,6 +1103,13 @@ const jobValues = (job: StoredJob): unknown[] => [
   job.requestFingerprint ?? null,
   job.callbackUrl ?? null,
   job.cancellationState ?? null,
+  job.accessTokenHash ?? null,
+  job.outputUrlPrivate ?? null,
+  job.outputUrlRedacted ?? null,
+  job.callbackUrlPrivate ?? null,
+  job.callbackUrlRedacted ?? null,
+  job.nextPollAt ?? null,
+  job.pollAttemptCount,
 ];
 
 const jobUpdateValues = (job: StoredJob): unknown[] => [
@@ -736,5 +1142,12 @@ const jobUpdateValues = (job: StoredJob): unknown[] => [
   job.requestFingerprint ?? null,
   job.callbackUrl ?? null,
   job.cancellationState ?? null,
+  job.accessTokenHash ?? null,
+  job.outputUrlPrivate ?? null,
+  job.outputUrlRedacted ?? null,
+  job.callbackUrlPrivate ?? null,
+  job.callbackUrlRedacted ?? null,
+  job.nextPollAt ?? null,
+  job.pollAttemptCount,
   job.id,
 ];

@@ -25,5 +25,5 @@ jobs:
       - run: corepack pnpm test:integration
       - run: corepack pnpm build
       - run: corepack pnpm exec playwright install --with-deps chromium
-      - run: corepack pnpm test:e2e -- --project=chromium-laptop
+      - run: corepack pnpm test:e2e -- --project=chromium-1280
       - run: corepack pnpm secrets:scan

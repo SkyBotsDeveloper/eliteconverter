@@ -15,7 +15,8 @@ Created by Siddhartha Abhimanyu
 - API: Hono on Cloudflare Workers with versioned `/api/v1` routes.
 - Storage: D1 migrations plus memory repository for tests and local fallback.
 - Queue: Cloudflare Queue producer/consumer path plus direct local processing when no queue binding exists.
-- Providers: deterministic mock provider and configurable generic HTTP provider.
+- Providers: deterministic mock provider, configurable generic HTTP provider and opt-in dedicated
+  CloudConvert provider.
 - Security: SSRF checks, API-key hashing, rate limiting, Turnstile verification, signed webhooks, CORS, security headers and log redaction.
 - Tests: Vitest unit and integration tests plus Playwright accessibility and responsive e2e tests.
 

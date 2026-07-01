@@ -52,6 +52,121 @@ MAX_ANONYMOUS_JOBS_PER_DAY = "20"
 [env.staging]
 name = "eliteconverter-staging"
 
+[env.staging.assets]
+directory = "apps/web/dist"
+binding = "ASSETS"
+
+[[env.staging.d1_databases]]
+binding = "DB"
+database_name = "eliteconverter-staging"
+database_id = "00000000-0000-0000-0000-000000000000"
+migrations_dir = "apps/api/migrations"
+
+[[env.staging.queues.producers]]
+binding = "CONVERSION_QUEUE"
+queue = "eliteconverter-staging-conversions"
+
+[[env.staging.queues.consumers]]
+queue = "eliteconverter-staging-conversions"
+max_batch_size = 5
+max_batch_timeout = 30
+max_retries = 3
+
+[[env.staging.ratelimits]]
+name = "RATE_LIMITER"
+namespace_id = "1001"
+simple = { limit = 60, period = 60 }
+
+[env.staging.triggers]
+crons = ["*/10 * * * *"]
+
+[env.staging.vars]
+APP_ENV = "staging"
+APP_BASE_URL = "https://eliteconverter-staging.workers.dev"
+API_BASE_URL = "https://eliteconverter-staging.workers.dev/api/v1"
+CORS_ALLOWED_ORIGINS = "https://eliteconverter-staging.workers.dev"
+ENABLED_PROVIDERS = "generic"
+PROVIDER_PRIORITY = "generic"
+GENERIC_PROVIDER_AUTH_HEADER = "Authorization"
+GENERIC_PROVIDER_AUTH_SCHEME = "Bearer"
+GENERIC_PROVIDER_CREATE_PATH = "/jobs"
+GENERIC_PROVIDER_STATUS_PATH = "/jobs/{id}"
+GENERIC_PROVIDER_CANCEL_PATH = "/jobs/{id}/cancel"
+GENERIC_PROVIDER_REFRESH_PATH = "/jobs/{id}/download"
+GENERIC_PROVIDER_TIMEOUT_MS = "10000"
+CLOUDCONVERT_BASE_URL = "https://api.cloudconvert.com/v2"
+CLOUDCONVERT_FORMATS = "mp4,webm,mkv"
+CLOUDCONVERT_QUALITIES = "source"
+CLOUDCONVERT_TIMEOUT_MS = "10000"
+MAX_PROVIDER_ATTEMPTS = "3"
+MAX_RETRY_ATTEMPTS = "3"
+INITIAL_RETRY_DELAY_MS = "1000"
+MAX_RETRY_DELAY_MS = "60000"
+JOB_EXPIRATION_HOURS = "24"
+STUCK_JOB_THRESHOLD_MINUTES = "15"
+CIRCUIT_BREAKER_THRESHOLD = "3"
+CIRCUIT_BREAKER_COOLDOWN_SECONDS = "60"
+MAX_CONCURRENT_JOBS_PER_USER = "5"
+MAX_ANONYMOUS_JOBS_PER_DAY = "20"
+CLIENT_WEBHOOK_MAX_ATTEMPTS = "8"
+
 [env.production]
 name = "eliteconverter-production"
-route = { pattern = "eliteconverter.example.com/*", custom_domain = true }
+
+[env.production.assets]
+directory = "apps/web/dist"
+binding = "ASSETS"
+
+[[env.production.d1_databases]]
+binding = "DB"
+database_name = "eliteconverter-production"
+database_id = "00000000-0000-0000-0000-000000000000"
+migrations_dir = "apps/api/migrations"
+
+[[env.production.queues.producers]]
+binding = "CONVERSION_QUEUE"
+queue = "eliteconverter-production-conversions"
+
+[[env.production.queues.consumers]]
+queue = "eliteconverter-production-conversions"
+max_batch_size = 5
+max_batch_timeout = 30
+max_retries = 3
+
+[[env.production.ratelimits]]
+name = "RATE_LIMITER"
+namespace_id = "1001"
+simple = { limit = 60, period = 60 }
+
+[env.production.triggers]
+crons = ["*/10 * * * *"]
+
+[env.production.vars]
+APP_ENV = "production"
+APP_BASE_URL = "https://eliteconverter-production.workers.dev"
+API_BASE_URL = "https://eliteconverter-production.workers.dev/api/v1"
+CORS_ALLOWED_ORIGINS = "https://eliteconverter-production.workers.dev"
+ENABLED_PROVIDERS = "generic"
+PROVIDER_PRIORITY = "generic"
+GENERIC_PROVIDER_AUTH_HEADER = "Authorization"
+GENERIC_PROVIDER_AUTH_SCHEME = "Bearer"
+GENERIC_PROVIDER_CREATE_PATH = "/jobs"
+GENERIC_PROVIDER_STATUS_PATH = "/jobs/{id}"
+GENERIC_PROVIDER_CANCEL_PATH = "/jobs/{id}/cancel"
+GENERIC_PROVIDER_REFRESH_PATH = "/jobs/{id}/download"
+GENERIC_PROVIDER_TIMEOUT_MS = "10000"
+CLOUDCONVERT_BASE_URL = "https://api.cloudconvert.com/v2"
+CLOUDCONVERT_FORMATS = "mp4,webm,mkv"
+CLOUDCONVERT_QUALITIES = "source"
+CLOUDCONVERT_TIMEOUT_MS = "10000"
+MAX_PROVIDER_ATTEMPTS = "3"
+MAX_RETRY_ATTEMPTS = "3"
+INITIAL_RETRY_DELAY_MS = "1000"
+MAX_RETRY_DELAY_MS = "60000"
+JOB_EXPIRATION_HOURS = "24"
+STUCK_JOB_THRESHOLD_MINUTES = "15"
+CIRCUIT_BREAKER_THRESHOLD = "3"
+CIRCUIT_BREAKER_COOLDOWN_SECONDS = "60"
+MAX_CONCURRENT_JOBS_PER_USER = "5"
+MAX_ANONYMOUS_JOBS_PER_DAY = "20"
+CLIENT_WEBHOOK_MAX_ATTEMPTS = "8"

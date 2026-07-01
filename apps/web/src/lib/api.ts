@@ -17,6 +17,13 @@ export interface CreateConversionInput {
   callbackUrl?: string;
 }
 
+interface CreateConversionResponse {
+  jobId: string;
+  status: string;
+  statusUrl: string;
+  accessToken?: string;
+}
+
 export const api = {
   capabilities: async (): Promise<CapabilitiesResponse> => {
     if (demoMode) return demoCapabilities;
@@ -24,10 +31,10 @@ export const api = {
   },
   createPublicConversion: async (
     input: CreateConversionInput,
-  ): Promise<{ jobId: string; status: string; statusUrl: string }> => {
+  ): Promise<CreateConversionResponse> => {
     if (demoMode) return demoCreate(input);
-    return unwrap(
-      await request("/public/conversions", {
+    const created = unwrap(
+      await request<CreateConversionResponse>("/public/conversions", {
         method: "POST",
         body: JSON.stringify({
           ...input,
@@ -35,10 +42,14 @@ export const api = {
         }),
       }),
     );
+    if (created.accessToken) storeJobAccessToken(created.jobId, created.accessToken);
+    return created;
   },
   job: async (jobId: string): Promise<PublicJob> => {
     if (demoMode) return demoJob(jobId);
-    return unwrap(await request<PublicJob>(`/conversions/${jobId}`));
+    return unwrap(
+      await request<PublicJob>(`/conversions/${jobId}`, { headers: jobAuthHeaders(jobId) }),
+    );
   },
   events: async (
     jobId: string,
@@ -63,7 +74,9 @@ export const api = {
         ],
       };
     }
-    return unwrap(await request(`/conversions/${jobId}/events`));
+    return unwrap(
+      await request(`/conversions/${jobId}/events`, { headers: jobAuthHeaders(jobId) }),
+    );
   },
   cancel: async (jobId: string): Promise<PublicJob> => {
     if (demoMode) {
@@ -77,11 +90,32 @@ export const api = {
       demoJobs.set(jobId, cancelled);
       return cancelled;
     }
-    return unwrap(await request(`/conversions/${jobId}/cancel`, { method: "POST" }));
+    return unwrap(
+      await request(`/conversions/${jobId}/cancel`, {
+        method: "POST",
+        headers: jobAuthHeaders(jobId),
+      }),
+    );
   },
   refreshDownload: async (jobId: string): Promise<PublicJob> => {
     if (demoMode) return demoJob(jobId);
-    return unwrap(await request(`/conversions/${jobId}/refresh-download`, { method: "POST" }));
+    return unwrap(
+      await request(`/conversions/${jobId}/refresh-download`, {
+        method: "POST",
+        headers: jobAuthHeaders(jobId),
+      }),
+    );
+  },
+  download: async (jobId: string): Promise<{ url: string; expiresAt?: string }> => {
+    if (demoMode) {
+      return {
+        url: "https://downloads.example.com/eliteconverter/demo.mp4?token=demo-token",
+        expiresAt: new Date(Date.now() + 3_600_000).toISOString(),
+      };
+    }
+    return unwrap(
+      await request(`/conversions/${jobId}/download`, { headers: jobAuthHeaders(jobId) }),
+    );
   },
   status: async (): Promise<StatusResponse> => {
     if (demoMode) {
@@ -112,6 +146,19 @@ const request = async <T>(path: string, init?: RequestInit): Promise<ApiResponse
 const unwrap = <T>(response: ApiResponse<T>): T => {
   if (response.success) return response.data;
   throw new Error(response.error.message);
+};
+
+const jobTokenStorageKey = (jobId: string): string => `eliteconverter.job.${jobId}.accessToken`;
+
+const storeJobAccessToken = (jobId: string, accessToken: string): void => {
+  if (typeof window === "undefined") return;
+  window.sessionStorage.setItem(jobTokenStorageKey(jobId), accessToken);
+};
+
+const jobAuthHeaders = (jobId: string): Record<string, string> => {
+  if (typeof window === "undefined") return {};
+  const accessToken = window.sessionStorage.getItem(jobTokenStorageKey(jobId));
+  return accessToken ? { "EliteConverter-Job-Token": accessToken } : {};
 };
 
 const demoCapabilities: CapabilitiesResponse = {

@@ -12,8 +12,16 @@ export interface RateLimiterBinding {
 }
 
 export interface QueuePayload {
+  kind:
+    | "submit_provider_job"
+    | "poll_provider_job"
+    | "refresh_provider_job"
+    | "deliver_client_webhook"
+    | "reconcile_stuck_job";
   jobId: string;
   requestId: string;
+  dedupeKey: string;
+  webhookEventId?: string;
 }
 
 export interface Env {
@@ -31,6 +39,8 @@ export interface Env {
   CLIENT_WEBHOOK_SIGNING_SECRET?: string;
   ENABLED_PROVIDERS?: string;
   PROVIDER_PRIORITY?: string;
+  MOCK_PROVIDER_FORMATS?: string;
+  MOCK_PROVIDER_QUALITIES?: string;
   GENERIC_PROVIDER_BASE_URL?: string;
   GENERIC_PROVIDER_API_KEY?: string;
   GENERIC_PROVIDER_AUTH_HEADER?: string;
@@ -41,6 +51,12 @@ export interface Env {
   GENERIC_PROVIDER_REFRESH_PATH?: string;
   GENERIC_PROVIDER_WEBHOOK_SECRET?: string;
   GENERIC_PROVIDER_TIMEOUT_MS?: string;
+  CLOUDCONVERT_BASE_URL?: string;
+  CLOUDCONVERT_API_KEY?: string;
+  CLOUDCONVERT_WEBHOOK_SIGNING_SECRET?: string;
+  CLOUDCONVERT_FORMATS?: string;
+  CLOUDCONVERT_QUALITIES?: string;
+  CLOUDCONVERT_TIMEOUT_MS?: string;
   MAX_PROVIDER_ATTEMPTS?: string;
   MAX_RETRY_ATTEMPTS?: string;
   INITIAL_RETRY_DELAY_MS?: string;
@@ -51,6 +67,8 @@ export interface Env {
   CIRCUIT_BREAKER_COOLDOWN_SECONDS?: string;
   MAX_CONCURRENT_JOBS_PER_USER?: string;
   MAX_ANONYMOUS_JOBS_PER_DAY?: string;
+  CALLBACK_HOST_ALLOWLIST?: string;
+  CLIENT_WEBHOOK_MAX_ATTEMPTS?: string;
   TEST_REPOSITORY?: MemoryRepository;
   TEST_FETCH?: typeof fetch;
 }
@@ -65,6 +83,8 @@ export interface AppConfig {
   clientWebhookSigningSecret: string;
   enabledProviders: string[];
   providerPriority: string[];
+  mockProviderFormats: OutputFormat[];
+  mockProviderQualities: QualityOption[];
   genericProvider: {
     baseUrl: string;
     apiKey: string;
@@ -77,6 +97,14 @@ export interface AppConfig {
     webhookSecret?: string;
     timeoutMs: number;
   };
+  cloudConvertProvider: {
+    baseUrl: string;
+    apiKey: string;
+    webhookSigningSecret?: string;
+    formats: OutputFormat[];
+    qualities: QualityOption[];
+    timeoutMs: number;
+  };
   maxProviderAttempts: number;
   maxRetryAttempts: number;
   initialRetryDelayMs: number;
@@ -87,6 +115,8 @@ export interface AppConfig {
   circuitBreakerCooldownSeconds: number;
   maxConcurrentJobsPerUser: number;
   maxAnonymousJobsPerDay: number;
+  callbackHostAllowlist: string[];
+  clientWebhookMaxAttempts: number;
 }
 
 export interface RequestContext {
@@ -136,13 +166,51 @@ export interface StoredJob {
   expiresAt: string;
   completedAt?: string;
   outputUrl?: string;
+  outputUrlPrivate?: string;
+  outputUrlRedacted?: string;
   outputUrlExpiresAt?: string;
   outputMimeType?: string;
   outputFileSize?: number;
+  accessTokenHash?: string;
   idempotencyKey?: string;
   requestFingerprint?: string;
   callbackUrl?: string;
+  callbackUrlPrivate?: string;
+  callbackUrlRedacted?: string;
   cancellationState?: string;
+  nextPollAt?: string;
+  pollAttemptCount: number;
+}
+
+export interface ScheduledTask {
+  id: string;
+  kind: QueuePayload["kind"];
+  jobId?: string;
+  payload: QueuePayload;
+  runAt: string;
+  status: "pending" | "processing" | "completed" | "failed";
+  attempts: number;
+  dedupeKey: string;
+  lastError?: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface ClientWebhookEvent {
+  id: string;
+  jobId: string;
+  eventId: string;
+  eventType: string;
+  payloadJson: string;
+  callbackUrlPrivate: string;
+  callbackUrlRedacted: string;
+  status: "pending" | "delivering" | "delivered" | "retrying" | "permanently_failed";
+  attemptCount: number;
+  lastStatusCode?: number;
+  lastError?: string;
+  nextAttemptAt?: string;
+  createdAt: string;
+  updatedAt: string;
 }
 
 export interface StoredProviderAttempt {

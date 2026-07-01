@@ -106,6 +106,7 @@ GET /api/v1/health
 GET /api/v1/capabilities
 POST /api/v1/conversions
 GET /api/v1/conversions/:jobId
+GET /api/v1/conversions/:jobId/download
 POST /api/v1/conversions/:jobId/cancel
         `}</Code>
       </>
@@ -170,9 +171,10 @@ Idempotency-Key: customer-request-001
   "jobId": "ec_job_xxxxxxxxx",
   "status": "completed",
   "progress": 100,
-  "outputUrl": "https://downloads.example.com/file.mp4?token=<redacted>"
+  "outputMimeType": "video/mp4"
 }
         `}</Code>
+        <p>Use the protected download endpoint to retrieve the private signed output URL.</p>
       </>
     ),
   },

@@ -26,12 +26,27 @@ jobs:
       - run: corepack pnpm test:unit
       - run: corepack pnpm test:integration
       - run: corepack pnpm build
+      - run: corepack pnpm exec playwright install --with-deps chromium
+      - run: corepack pnpm test:e2e -- --project=chromium-1280
+      - run: corepack pnpm secrets:scan
+      - name: Check Cloudflare deployment secrets
+        id: cloudflare
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        shell: bash
+        run: |
+          if [[ -n "${CLOUDFLARE_API_TOKEN}" && -n "${CLOUDFLARE_ACCOUNT_ID}" ]]; then
+            echo "available=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "available=false" >> "$GITHUB_OUTPUT"
+          fi
       - name: Deploy staging when secrets exist
-        if: ${{ secrets.CLOUDFLARE_API_TOKEN != '' && secrets.CLOUDFLARE_ACCOUNT_ID != '' }}
+        if: steps.cloudflare.outputs.available == 'true'
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
         run: corepack pnpm deploy:staging
       - name: Skip deployment
-        if: ${{ secrets.CLOUDFLARE_API_TOKEN == '' || secrets.CLOUDFLARE_ACCOUNT_ID == '' }}
+        if: steps.cloudflare.outputs.available != 'true'
         run: echo "Cloudflare deployment skipped because optional secrets are not configured."

@@ -1,4 +1,5 @@
 import { PublicApiError, classifyProviderHttpStatus } from "./catalog";
+import { hmacSha256Hex, timingSafeEqual } from "./crypto";
 import type {
   OutputFormat,
   ProviderCapabilities,
@@ -87,17 +88,25 @@ export interface ConversionProvider {
 export class MockProvider implements ConversionProvider {
   readonly id = "mock";
   readonly displayName = "Mock Provider";
-  private readonly jobs = new Map<string, { scenario: string; polls: number; jobId: string }>();
+  private static readonly jobs = new Map<
+    string,
+    { scenario: string; polls: number; jobId: string }
+  >();
+  private readonly capabilities: ProviderCapabilities;
 
-  async getCapabilities(): Promise<ProviderCapabilities> {
-    return {
-      formats: [...outputFormats],
-      qualities: [...qualityOptions],
+  constructor(capabilities?: Partial<Pick<ProviderCapabilities, "formats" | "qualities">>) {
+    this.capabilities = {
+      formats: capabilities?.formats ?? [...outputFormats],
+      qualities: capabilities?.qualities ?? [...qualityOptions],
       supportsWebhooks: true,
       supportsCancellation: true,
       supportsRefreshDownloadUrl: true,
       maxInputUrlLength: 4096,
     };
+  }
+
+  async getCapabilities(): Promise<ProviderCapabilities> {
+    return this.capabilities;
   }
 
   async createJob(
@@ -116,7 +125,7 @@ export class MockProvider implements ConversionProvider {
     }
 
     const providerJobId = `mock_${input.jobId}`;
-    this.jobs.set(providerJobId, { scenario, polls: 0, jobId: input.jobId });
+    MockProvider.jobs.set(providerJobId, { scenario, polls: 0, jobId: input.jobId });
     return { providerJobId, status: scenario === "retry" ? "retrying" : "queued" };
   }
 
@@ -124,7 +133,7 @@ export class MockProvider implements ConversionProvider {
     providerJobId: string,
     _context?: ProviderRequestContext,
   ): Promise<ProviderJobStatusResult> {
-    const job = this.jobs.get(providerJobId);
+    const job = MockProvider.jobs.get(providerJobId);
     if (!job) {
       throw new PublicApiError("provider_permanent_failure", 404, "Unknown mock provider job");
     }
@@ -150,6 +159,17 @@ export class MockProvider implements ConversionProvider {
         retryable: false,
       };
     }
+    if (job.scenario.startsWith("long-")) {
+      const requiredPolls = Number(job.scenario.replace("long-", ""));
+      if (Number.isFinite(requiredPolls) && job.polls <= requiredPolls) {
+        return {
+          providerJobId,
+          status: "processing",
+          progress: Math.min(95, Math.floor((job.polls / requiredPolls) * 90)),
+          stage: `processing poll ${job.polls}`,
+        };
+      }
+    }
     if (job.scenario === "retry" && job.polls < 2) {
       return {
         providerJobId,
@@ -171,7 +191,7 @@ export class MockProvider implements ConversionProvider {
   }
 
   async cancelJob(providerJobId: string, _context?: ProviderRequestContext): Promise<void> {
-    this.jobs.delete(providerJobId);
+    MockProvider.jobs.delete(providerJobId);
   }
 
   async refreshDownloadUrl(
@@ -199,11 +219,168 @@ export class MockProvider implements ConversionProvider {
 
   private makeDownload(providerJobId: string, hours = 1): ProviderDownloadResult {
     return {
-      url: `https://downloads.example.com/eliteconverter/${encodeURIComponent(providerJobId)}.mp4?token=<mock>`,
+      url: `https://downloads.example.com/eliteconverter/${encodeURIComponent(providerJobId)}.mp4?token=mock-token&signature=mock-signature&policy=mock-policy&expires=4102444800`,
       expiresAt: new Date(Date.now() + hours * 60 * 60 * 1000).toISOString(),
       mimeType: "video/mp4",
       fileSize: 1048576,
     };
+  }
+}
+
+export interface CloudConvertProviderConfig {
+  baseUrl: string;
+  apiKey: string;
+  webhookSigningSecret?: string;
+  timeoutMs: number;
+  formats: OutputFormat[];
+  qualities: QualityOption[];
+}
+
+export class CloudConvertProvider implements ConversionProvider {
+  readonly id = "cloudconvert";
+  readonly displayName = "CloudConvert";
+  private readonly config: CloudConvertProviderConfig;
+
+  constructor(config: CloudConvertProviderConfig) {
+    if (!config.baseUrl.trim() || !config.apiKey.trim()) {
+      throw new PublicApiError(
+        "internal_configuration_error",
+        500,
+        "CloudConvert provider is enabled but required configuration is missing",
+      );
+    }
+    validateExternalUrl(config.baseUrl, "internal_configuration_error");
+    this.config = config;
+  }
+
+  async getCapabilities(): Promise<ProviderCapabilities> {
+    return {
+      formats: this.config.formats,
+      qualities: this.config.qualities,
+      supportsWebhooks: Boolean(this.config.webhookSigningSecret),
+      supportsCancellation: false,
+      supportsRefreshDownloadUrl: true,
+      maxInputUrlLength: 4096,
+    };
+  }
+
+  async createJob(
+    input: ProviderCreateJobInput,
+    context: ProviderRequestContext,
+  ): Promise<ProviderCreateJobResult> {
+    const response = await this.request(context, "/jobs", {
+      method: "POST",
+      body: JSON.stringify({
+        tag: input.jobId,
+        tasks: {
+          "import-source": {
+            operation: "import/url",
+            url: input.sourceUrl,
+          },
+          "convert-output": {
+            operation: "convert",
+            input: "import-source",
+            output_format: input.format,
+          },
+          "export-output": {
+            operation: "export/url",
+            input: "convert-output",
+          },
+        },
+      }),
+    });
+    const job = readCloudConvertJob(await response.json());
+    if (!job.id) throw new PublicApiError("provider_temporary_failure", 502);
+    return {
+      providerJobId: job.id,
+      status: normalizeCloudConvertStatus(job.status),
+      download: cloudConvertDownload(job),
+    };
+  }
+
+  async getJobStatus(
+    providerJobId: string,
+    context: ProviderRequestContext,
+  ): Promise<ProviderJobStatusResult> {
+    const response = await this.request(context, `/jobs/${encodeURIComponent(providerJobId)}`);
+    const job = readCloudConvertJob(await response.json());
+    const status = normalizeCloudConvertStatus(job.status);
+    return {
+      providerJobId,
+      status,
+      progress: status === "completed" || status === "failed" ? 100 : cloudConvertProgress(job),
+      stage: cloudConvertStage(job),
+      download: cloudConvertDownload(job),
+      errorCode: status === "failed" ? "conversion_failed" : undefined,
+      retryable: false,
+    };
+  }
+
+  async refreshDownloadUrl(
+    providerJobId: string,
+    context: ProviderRequestContext,
+  ): Promise<ProviderDownloadResult> {
+    const status = await this.getJobStatus(providerJobId, context);
+    if (!status.download) throw new PublicApiError("output_expired", 400);
+    return status.download;
+  }
+
+  async verifyWebhook(request: Request): Promise<VerifiedProviderWebhookEvent> {
+    if (!this.config.webhookSigningSecret) {
+      throw new PublicApiError("internal_configuration_error", 500, "Missing webhook secret");
+    }
+    const body = await request.text();
+    const signature = request.headers.get("CloudConvert-Signature");
+    const expected = await hmacSha256Hex(this.config.webhookSigningSecret, body);
+    if (!signature || !timingSafeEqual(signature, expected)) {
+      throw new PublicApiError("forbidden", 403, "Invalid provider webhook signature");
+    }
+    const parsed = JSON.parse(body) as unknown;
+    if (!isRecord(parsed) || !isRecord(parsed.job)) {
+      throw new PublicApiError("validation_error", 400);
+    }
+    const job = readCloudConvertJob({ data: parsed.job });
+    const event = typeof parsed.event === "string" ? parsed.event : job.status;
+    const status = event === "job.failed" ? "failed" : normalizeCloudConvertStatus(job.status);
+    return {
+      providerId: this.id,
+      providerEventId: `${event}:${job.id}`,
+      providerJobId: job.id,
+      status,
+      progress: status === "completed" || status === "failed" ? 100 : cloudConvertProgress(job),
+      download: cloudConvertDownload(job),
+    };
+  }
+
+  private async request(
+    context: ProviderRequestContext,
+    path: string,
+    init: RequestInit = {},
+  ): Promise<Response> {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), this.config.timeoutMs);
+    const url = new URL(path, this.config.baseUrl).toString();
+    validateExternalUrl(url, "internal_configuration_error");
+    try {
+      const response = await context.fetcher(url, {
+        ...init,
+        signal: controller.signal,
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${this.config.apiKey}`,
+          ...(init.headers ?? {}),
+        },
+      });
+      if (!response.ok) {
+        throw new PublicApiError(classifyProviderHttpStatus(response.status), response.status);
+      }
+      return response;
+    } catch (error) {
+      if (error instanceof PublicApiError) throw error;
+      throw new PublicApiError("provider_timeout", 504, "Provider request failed or timed out");
+    } finally {
+      clearTimeout(timeout);
+    }
   }
 }
 
@@ -420,6 +597,92 @@ const scenarioFromUrl = (rawUrl: string): string => {
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === "object" && value !== null && !Array.isArray(value);
+
+interface CloudConvertTask {
+  name?: string;
+  operation?: string;
+  status?: string;
+  result?: {
+    files?: Array<{
+      url?: string;
+      filename?: string;
+      size?: number;
+    }>;
+  };
+}
+
+interface CloudConvertJob {
+  id: string;
+  status: string;
+  tasks: CloudConvertTask[];
+}
+
+const readCloudConvertJob = (body: unknown): CloudConvertJob => {
+  if (!isRecord(body) || !isRecord(body.data)) {
+    throw new PublicApiError("provider_temporary_failure", 502);
+  }
+  const tasks = Array.isArray(body.data.tasks)
+    ? body.data.tasks.filter(isRecord).map((task) => ({
+        name: typeof task.name === "string" ? task.name : undefined,
+        operation: typeof task.operation === "string" ? task.operation : undefined,
+        status: typeof task.status === "string" ? task.status : undefined,
+        result: isRecord(task.result)
+          ? {
+              files: Array.isArray(task.result.files)
+                ? task.result.files.filter(isRecord).map((file) => ({
+                    url: typeof file.url === "string" ? file.url : undefined,
+                    filename: typeof file.filename === "string" ? file.filename : undefined,
+                    size: typeof file.size === "number" ? file.size : undefined,
+                  }))
+                : undefined,
+            }
+          : undefined,
+      }))
+    : [];
+  return {
+    id: typeof body.data.id === "string" ? body.data.id : "",
+    status: typeof body.data.status === "string" ? body.data.status : "waiting",
+    tasks,
+  };
+};
+
+const normalizeCloudConvertStatus = (status: string): ProviderStatus => {
+  switch (status) {
+    case "finished":
+      return "completed";
+    case "error":
+      return "failed";
+    case "waiting":
+      return "queued";
+    default:
+      return "processing";
+  }
+};
+
+const cloudConvertDownload = (job: CloudConvertJob): ProviderDownloadResult | undefined => {
+  const exportTask =
+    job.tasks.find((task) => task.operation === "export/url") ??
+    job.tasks.find((task) => task.name === "export-output");
+  const file = exportTask?.result?.files?.find((candidate) => candidate.url);
+  if (!file?.url) return undefined;
+  return {
+    url: file.url,
+    fileSize: file.size,
+  };
+};
+
+const cloudConvertStage = (job: CloudConvertJob): string => {
+  const active =
+    job.tasks.find((task) => task.status === "processing") ??
+    job.tasks.find((task) => task.status === "waiting");
+  return active?.operation ?? job.status;
+};
+
+const cloudConvertProgress = (job: CloudConvertJob): number => {
+  if (!job.tasks.length) return 10;
+  const finished = job.tasks.filter((task) => task.status === "finished").length;
+  return Math.max(10, Math.min(95, Math.round((finished / job.tasks.length) * 90)));
+};
 
 const readMappedString = (object: Record<string, unknown>, path: string, fallback = ""): string => {
   const value = path.split(".").reduce<unknown>((current, key) => {

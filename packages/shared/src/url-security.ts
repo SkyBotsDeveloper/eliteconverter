@@ -153,6 +153,7 @@ export interface RedirectValidationOptions {
   fetcher: typeof fetch;
   maxRedirects?: number;
   expectedContentTypes?: string[];
+  timeoutMs?: number;
 }
 
 export const validateRedirectChain = async (
@@ -161,9 +162,23 @@ export const validateRedirectChain = async (
 ): Promise<Response> => {
   let current = validateExternalUrl(rawUrl, "output_unavailable").url;
   const maxRedirects = options.maxRedirects ?? 3;
+  const timeoutMs = options.timeoutMs ?? 10000;
 
   for (let redirectCount = 0; redirectCount <= maxRedirects; redirectCount += 1) {
-    const response = await options.fetcher(current, { method: "HEAD", redirect: "manual" });
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), timeoutMs);
+    let response: Response;
+    try {
+      response = await options.fetcher(current, {
+        method: "HEAD",
+        redirect: "manual",
+        signal: controller.signal,
+      });
+    } catch {
+      throw new PublicApiError("output_unavailable", 502, "Output URL validation timed out");
+    } finally {
+      clearTimeout(timeout);
+    }
     if (response.status >= 300 && response.status < 400) {
       const location = response.headers.get("location");
       if (!location)
@@ -179,6 +194,9 @@ export const validateRedirectChain = async (
       !options.expectedContentTypes.some((type) => contentType.includes(type))
     ) {
       throw new PublicApiError("output_unavailable", 502, "Unexpected output content type");
+    }
+    if (response.status >= 400) {
+      throw new PublicApiError("output_unavailable", 502, "Output URL returned an error status");
     }
     return response;
   }
