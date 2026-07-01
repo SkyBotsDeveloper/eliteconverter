@@ -1,0 +1,16 @@
+{
+  "name": "EliteConverter",
+  "short_name": "EliteConverter",
+  "description": "Convert Streams. Deliver Anywhere.",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#f8fafc",
+  "theme_color": "#0f766e",
+  "icons": [
+    {
+      "src": "/favicon.svg",
+      "sizes": "48x48",
+      "type": "image/svg+xml"
+    }
+  ]
+}

@@ -1,0 +1,24 @@
+{
+  "name": "@eliteconverter/api",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts",
+    "./app": "./src/app.ts"
+  },
+  "scripts": {
+    "dev": "wrangler dev --local --test-scheduled",
+    "build": "wrangler deploy --dry-run --outdir dist",
+    "typecheck": "tsc -p tsconfig.json",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@eliteconverter/shared": "workspace:*",
+    "hono": "4.12.27",
+    "zod": "4.4.3"
+  },
+  "devDependencies": {
+    "@eliteconverter/tsconfig": "workspace:*"
+  }
+}
