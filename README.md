@@ -2,7 +2,7 @@
 
 Convert Streams. Deliver Anywhere.
 
-EliteConverter is a TypeScript monorepo for a Cloudflare Workers web platform and developer API. It accepts authorized M3U8 media URLs, validates them, creates asynchronous conversion jobs and delegates conversion to configured third-party providers. The Worker does not perform native video transcoding or buffer large video files.
+EliteConverter is a TypeScript monorepo for a Cloudflare Workers web platform and developer API. It validates authorized media URLs, creates asynchronous conversion jobs and delegates conversion to configured third-party providers. The Worker does not perform native video transcoding or buffer large video files. Production M3U8 conversion remains disabled unless an operator configures and verifies a provider that genuinely supports permitted HLS playlists.
 
 Created by Siddhartha Abhimanyu
 
@@ -140,6 +140,7 @@ Required for real conversion provider:
 ```bash
 corepack pnpm wrangler d1 create eliteconverter
 corepack pnpm wrangler queues create eliteconverter-conversions
+corepack pnpm wrangler queues create eliteconverter-conversions-dlq
 corepack pnpm db:migrate:local
 corepack pnpm db:migrate:production
 ```
@@ -161,7 +162,7 @@ curl -X POST "$API_BASE_URL/conversions" \
   -H "Authorization: Bearer $ELITECONVERTER_API_KEY" \
   -H "Content-Type: application/json" \
   -H "Idempotency-Key: customer-request-001" \
-  --data '{"url":"https://media.example.com/master.m3u8","format":"mp4","quality":"source"}'
+  --data '{"url":"https://media.example.com/input.mp4","format":"mp4","quality":"source"}'
 ```
 
 ## Testing Commands
@@ -207,6 +208,8 @@ See [docs/provider-adapters.md](docs/provider-adapters.md). API routes contain n
 - Real provider field mappings must be supplied by the operator. The generic provider does not invent undocumented schemas.
 - DNS rebinding defenses are limited by runtime DNS visibility; numeric and local/private hosts are rejected before fetch and on redirects.
 - Cloudflare deployment is prepared but cannot be verified without account resources and credentials.
+- CloudConvert imports ordinary media files with a filename extension; its adapter deliberately rejects M3U8 because direct HLS playlist conversion has not been verified.
+- CloudConvert `export/url` tasks and URLs are temporary and deleted after 24 hours, so the adapter does not advertise download refresh.
 - Mock provider downloads are redacted example URLs and are not real media files.
 
 ## Credits

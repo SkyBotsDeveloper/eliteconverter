@@ -98,8 +98,9 @@ const docsContent: Record<DocsPageKey, { title: string; body: ReactNode }> = {
     body: (
       <>
         <p>
-          EliteConverter accepts authorized M3U8 URLs, creates asynchronous jobs, submits them to
-          provider adapters and returns safe public status objects.
+          EliteConverter accepts authorized, provider-supported media URLs, creates asynchronous
+          jobs, submits them to provider adapters and returns safe public status objects. M3U8 is
+          unavailable until an operator verifies a capable provider in staging.
         </p>
         <Code language="http">{`
 GET /api/v1/health
@@ -151,7 +152,7 @@ Idempotency-Key: customer-request-001
       <>
         <Code language="json">{`
 {
-  "url": "https://example.com/master.m3u8",
+  "url": "https://example.com/input.mp4",
   "format": "mp4",
   "quality": "source",
   "callbackUrl": "https://client.example.com/webhooks/eliteconverter"
@@ -227,7 +228,7 @@ curl -X POST "$API_BASE_URL/conversions" \\
   -H "Authorization: Bearer $ELITECONVERTER_API_KEY" \\
   -H "Content-Type: application/json" \\
   -H "Idempotency-Key: customer-request-001" \\
-  --data '{"url":"https://media.example.com/master.m3u8","format":"mp4","quality":"source"}'
+  --data '{"url":"https://media.example.com/input.mp4","format":"mp4","quality":"source"}'
         `}</Code>
       </>
     ),

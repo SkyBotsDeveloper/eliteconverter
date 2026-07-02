@@ -14,7 +14,9 @@ Create these resources separately in each target Cloudflare account/environment:
 - Staging D1 database, for example `eliteconverter-staging`.
 - Production D1 database, for example `eliteconverter-production`.
 - Staging Queue, for example `eliteconverter-staging-conversions`.
+- Staging dead-letter Queue, for example `eliteconverter-staging-conversions-dlq`.
 - Production Queue, for example `eliteconverter-production-conversions`.
+- Production dead-letter Queue, for example `eliteconverter-production-conversions-dlq`.
 - Staging and production Turnstile site and secret keys.
 - Staging and production Workers Rate Limiting namespaces if available on the account.
 
@@ -53,6 +55,24 @@ corepack pnpm deploy:production
 ```
 
 Deployment is not complete until the Worker route, API health endpoint, static assets and queue consumer have been verified in the Cloudflare dashboard and through HTTP checks.
+
+## Real Provider Verification
+
+The real-provider integration test is skipped unless explicitly enabled. Supply a permitted,
+non-DRM VOD playlist and provider credentials only through the process environment:
+
+```bash
+RUN_REAL_PROVIDER_TEST=1 \
+REAL_PROVIDER_M3U8_URL="https://provider-authorized.example/test.m3u8" \
+REAL_PROVIDER_BASE_URL="https://provider.example/api" \
+REAL_PROVIDER_API_KEY="<secret>" \
+REAL_PROVIDER_EXPECT_AUDIO=1 \
+corepack pnpm test:integration
+```
+
+The harness waits for completion, validates every output redirect, requires an MP4 response with a
+non-zero body and uses `ffprobe` to require a playable video stream (and audio when requested). It
+does not print credentials, source URLs, signed output URLs or provider job payloads.
 
 ## Rollback
 

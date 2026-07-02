@@ -4,7 +4,7 @@ import AxeBuilder from "@axe-core/playwright";
 test("landing page, navigation and accessibility", async ({ page }) => {
   await page.goto("/");
   await expect(page.getByRole("heading", { name: "EliteConverter" })).toBeVisible();
-  await expect(page.getByLabel("M3U8 URL")).toBeVisible();
+  await expect(page.getByLabel("Source URL")).toBeVisible();
 
   const menu = page.getByLabel("Open navigation");
   if (await menu.isVisible()) {
@@ -22,11 +22,11 @@ test("landing page, navigation and accessibility", async ({ page }) => {
 
 test("conversion form validates permission and completes mock conversion", async ({ page }) => {
   await page.goto("/convert");
-  await page.getByLabel("M3U8 URL").fill("not-a-url");
+  await page.getByLabel("Source URL").fill("not-a-url");
   await page.getByRole("button", { name: /Start conversion/ }).click();
-  await expect(page.getByText("Enter a valid M3U8 URL")).toBeVisible();
+  await expect(page.getByText("Enter a valid media URL")).toBeVisible();
 
-  await page.getByLabel("M3U8 URL").fill("https://media.example.com/master.m3u8?mock=success");
+  await page.getByLabel("Source URL").fill("https://media.example.com/input.mp4?mock=success");
   await page.getByLabel("Only convert media").check();
   await page.getByRole("button", { name: /Start conversion/ }).click();
   await expect(page).toHaveURL(/\/jobs\/ec_job_demo_/);
@@ -36,7 +36,7 @@ test("conversion form validates permission and completes mock conversion", async
 
 test("mock failure flow shows safe error", async ({ page }) => {
   await page.goto("/convert");
-  await page.getByLabel("M3U8 URL").fill("https://media.example.com/master.m3u8?mock=fail");
+  await page.getByLabel("Source URL").fill("https://media.example.com/input.mp4?mock=fail");
   await page.getByLabel("Only convert media").check();
   await page.getByRole("button", { name: /Start conversion/ }).click();
   await expect(page).toHaveURL(/\/jobs\/ec_job_demo_/);

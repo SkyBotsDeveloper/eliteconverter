@@ -50,6 +50,7 @@ export interface Env {
   GENERIC_PROVIDER_CANCEL_PATH?: string;
   GENERIC_PROVIDER_REFRESH_PATH?: string;
   GENERIC_PROVIDER_WEBHOOK_SECRET?: string;
+  GENERIC_PROVIDER_SOURCE_EXTENSIONS?: string;
   GENERIC_PROVIDER_TIMEOUT_MS?: string;
   CLOUDCONVERT_BASE_URL?: string;
   CLOUDCONVERT_API_KEY?: string;
@@ -69,6 +70,11 @@ export interface Env {
   MAX_ANONYMOUS_JOBS_PER_DAY?: string;
   CALLBACK_HOST_ALLOWLIST?: string;
   CLIENT_WEBHOOK_MAX_ATTEMPTS?: string;
+  QUEUE_MAX_DELIVERY_ATTEMPTS?: string;
+  QUEUE_LEASE_SECONDS?: string;
+  SCHEDULED_TASK_LEASE_SECONDS?: string;
+  CLIENT_WEBHOOK_LEASE_SECONDS?: string;
+  CLIENT_WEBHOOK_TIMEOUT_MS?: string;
   TEST_REPOSITORY?: MemoryRepository;
   TEST_FETCH?: typeof fetch;
 }
@@ -95,6 +101,7 @@ export interface AppConfig {
     cancelPath?: string;
     refreshPath?: string;
     webhookSecret?: string;
+    sourceExtensions: string[];
     timeoutMs: number;
   };
   cloudConvertProvider: {
@@ -117,6 +124,11 @@ export interface AppConfig {
   maxAnonymousJobsPerDay: number;
   callbackHostAllowlist: string[];
   clientWebhookMaxAttempts: number;
+  queueMaxDeliveryAttempts: number;
+  queueLeaseSeconds: number;
+  scheduledTaskLeaseSeconds: number;
+  clientWebhookLeaseSeconds: number;
+  clientWebhookTimeoutMs: number;
 }
 
 export interface RequestContext {
@@ -191,7 +203,22 @@ export interface ScheduledTask {
   status: "pending" | "processing" | "completed" | "failed";
   attempts: number;
   dedupeKey: string;
+  leaseOwner?: string;
+  leaseExpiresAt?: string;
   lastError?: string;
+  completedAt?: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface QueueDelivery {
+  dedupeKey: string;
+  status: "pending" | "processing" | "completed" | "failed";
+  attemptCount: number;
+  leaseOwner?: string;
+  leaseExpiresAt?: string;
+  lastError?: string;
+  completedAt?: string;
   createdAt: string;
   updatedAt: string;
 }
@@ -206,6 +233,8 @@ export interface ClientWebhookEvent {
   callbackUrlRedacted: string;
   status: "pending" | "delivering" | "delivered" | "retrying" | "permanently_failed";
   attemptCount: number;
+  leaseOwner?: string;
+  leaseExpiresAt?: string;
   lastStatusCode?: number;
   lastError?: string;
   nextAttemptAt?: string;

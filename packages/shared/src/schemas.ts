@@ -111,6 +111,8 @@ export type ApiResponse<T> = ApiSuccess<T> | ApiFailure;
 export interface ProviderCapabilities {
   formats: OutputFormat[];
   qualities: QualityOption[];
+  sourceExtensions?: string[];
+  qualityFormats?: Partial<Record<QualityOption, OutputFormat[]>>;
   supportsWebhooks: boolean;
   supportsCancellation: boolean;
   supportsRefreshDownloadUrl: boolean;
@@ -151,6 +153,7 @@ export interface CapabilitiesResponse {
   tagline: "Convert Streams. Deliver Anywhere.";
   formats: OutputFormat[];
   qualities: QualityOption[];
+  qualityFormats: Partial<Record<QualityOption, OutputFormat[]>>;
   providers: Array<{
     id: string;
     displayName: string;

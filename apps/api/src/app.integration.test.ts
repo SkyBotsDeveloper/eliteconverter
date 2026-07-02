@@ -2,9 +2,22 @@ import { describe, expect, it } from "vitest";
 import { hashApiKey, randomId, type ApiResponse, type PublicJob } from "@eliteconverter/shared";
 import { app, handleQueueBatch } from "./app";
 import { getConfig } from "./config";
-import { processQueuePayload, reconcileJobs } from "./jobs";
+import {
+  cancelStoredJob,
+  processQueuePayload,
+  reconcileJobs,
+  refreshDownloadByInternalId,
+} from "./jobs";
 import { MemoryRepository } from "./repository";
-import type { Env, QueuePayload, RequestContext, StoredApiKey, StoredJob } from "./types";
+import type {
+  ClientWebhookEvent,
+  Env,
+  QueuePayload,
+  RequestContext,
+  ScheduledTask,
+  StoredApiKey,
+  StoredJob,
+} from "./types";
 
 const apiSecret = "test-only-api-key-hash-secret";
 
@@ -123,6 +136,48 @@ const makeStoredJob = (overrides: Partial<StoredJob> = {}): StoredJob => {
   };
 };
 
+const makeWebhookEvent = (
+  jobId: string,
+  eventId: string,
+  callbackUrlPrivate: string,
+  overrides: Partial<ClientWebhookEvent> = {},
+): ClientWebhookEvent => {
+  const now = new Date().toISOString();
+  return {
+    id: `cwe_${eventId}`,
+    jobId,
+    eventId,
+    eventType: "conversion.completed",
+    payloadJson: JSON.stringify({ id: eventId, type: "conversion.completed" }),
+    callbackUrlPrivate,
+    callbackUrlRedacted: callbackUrlPrivate,
+    status: "pending",
+    attemptCount: 0,
+    createdAt: now,
+    updatedAt: now,
+    ...overrides,
+  };
+};
+
+const processWebhookEvent = async (
+  event: ClientWebhookEvent,
+  env: Env,
+  repository: MemoryRepository,
+) => {
+  await repository.createClientWebhookEvent(event);
+  await processQueuePayload(
+    {
+      kind: "deliver_client_webhook",
+      jobId: event.jobId,
+      requestId: `req_${event.eventId}`,
+      dedupeKey: `${event.jobId}:deliver_client_webhook:${event.eventId}:${event.attemptCount}`,
+      webhookEventId: event.eventId,
+    },
+    contextFor(env),
+  );
+  return repository.getClientWebhookEvent(event.eventId);
+};
+
 describe("EliteConverter API", () => {
   it("serves health and dynamic capabilities", async () => {
     const { env, rawKey } = await createEnv({
@@ -153,6 +208,30 @@ describe("EliteConverter API", () => {
       env,
     );
     expect(unsupported.status).toBe(400);
+  });
+
+  it("does not accept M3U8 through an unverified generic provider", async () => {
+    const { env, rawKey } = await createEnv({
+      ENABLED_PROVIDERS: "generic",
+      PROVIDER_PRIORITY: "generic",
+      GENERIC_PROVIDER_BASE_URL: "https://provider.example.com",
+      GENERIC_PROVIDER_API_KEY: "provider-key",
+    });
+    const response = await app.fetch(
+      request("/api/v1/conversions", {
+        method: "POST",
+        headers: authHeaders(rawKey),
+        body: JSON.stringify({
+          url: "https://media.example.com/master.m3u8",
+          format: "mp4",
+          quality: "source",
+        }),
+      }),
+      env,
+    );
+    const body = await json<ApiResponse<unknown>>(response);
+    expect(response.status).toBe(400);
+    expect(!body.success && body.error.code).toBe("unsupported_source");
   });
 
   it("rejects unauthenticated private conversions", async () => {
@@ -380,7 +459,7 @@ describe("EliteConverter API", () => {
     };
     await processQueuePayload(dedupePayload, context);
     await processQueuePayload(dedupePayload, context);
-    expect(await repository.hasProcessedQueueDelivery("dedupe-once")).toBe(true);
+    expect((await repository.getQueueDelivery("dedupe-once"))?.status).toBe("completed");
 
     let acked = 0;
     let retried = 0;
@@ -441,6 +520,341 @@ describe("EliteConverter API", () => {
     expect(acked).toBe(2);
   });
 
+  it("retries unexpected queue exceptions instead of acknowledging them", async () => {
+    const { env, repository } = await createEnv();
+    const completed = makeStoredJob();
+    await repository.insertJob(completed);
+    repository.getJobById = async () => {
+      throw new Error("unexpected repository failure");
+    };
+
+    let acked = 0;
+    let retried = 0;
+    const payload: QueuePayload = {
+      kind: "reconcile_stuck_job",
+      jobId: completed.id,
+      requestId: "req_unexpected",
+      dedupeKey: "unexpected-retry",
+    };
+    await handleQueueBatch(
+      {
+        messages: [
+          {
+            body: payload,
+            ack: () => {
+              acked += 1;
+            },
+            retry: () => {
+              retried += 1;
+            },
+          },
+        ],
+      } as unknown as MessageBatch<QueuePayload>,
+      env,
+      {
+        waitUntil: () => undefined,
+        passThroughOnException: () => undefined,
+      } as unknown as ExecutionContext,
+    );
+
+    expect(acked).toBe(0);
+    expect(retried).toBe(1);
+    expect(await repository.getQueueDelivery(payload.dedupeKey)).toMatchObject({
+      status: "pending",
+      attemptCount: 1,
+    });
+  });
+
+  it("records an exhausted queue failure before acknowledging it", async () => {
+    const { env, repository } = await createEnv({ QUEUE_MAX_DELIVERY_ATTEMPTS: "2" });
+    const active = makeStoredJob({
+      id: "job_exhausted_queue",
+      publicId: "ec_job_exhausted_queue",
+      status: "processing",
+      completedAt: undefined,
+      providerId: undefined,
+      providerJobId: undefined,
+    });
+    await repository.insertJob(active);
+    const payload: QueuePayload = {
+      kind: "refresh_provider_job",
+      jobId: active.id,
+      requestId: "req_exhausted_queue",
+      dedupeKey: "exhausted-queue",
+    };
+    let acked = 0;
+    let retried = 0;
+    const deliver = () =>
+      handleQueueBatch(
+        {
+          messages: [
+            {
+              body: payload,
+              ack: () => {
+                acked += 1;
+              },
+              retry: () => {
+                retried += 1;
+              },
+            },
+          ],
+        } as unknown as MessageBatch<QueuePayload>,
+        env,
+        {
+          waitUntil: () => undefined,
+          passThroughOnException: () => undefined,
+        } as unknown as ExecutionContext,
+      );
+
+    await deliver();
+    await deliver();
+    expect({ acked, retried }).toEqual({ acked: 1, retried: 1 });
+    expect(await repository.getQueueDelivery(payload.dedupeKey)).toMatchObject({
+      status: "failed",
+      attemptCount: 2,
+    });
+    expect(await repository.getJobById(active.id)).toMatchObject({
+      status: "failed",
+      publicErrorCode: "output_unavailable",
+    });
+  });
+
+  it("atomically claims concurrent duplicate queue messages", async () => {
+    const { env, repository } = await createEnv();
+    const queued = makeStoredJob({
+      id: "job_atomic_queue",
+      publicId: "ec_job_atomic_queue",
+      status: "queued",
+      progress: 0,
+      currentStage: "queued",
+      providerId: undefined,
+      providerJobId: undefined,
+      providerAttemptCount: 0,
+      completedAt: undefined,
+      outputUrlPrivate: undefined,
+    });
+    await repository.insertJob(queued);
+    const payload: QueuePayload = {
+      kind: "submit_provider_job",
+      jobId: queued.id,
+      requestId: "req_atomic_queue",
+      dedupeKey: "atomic-queue-claim",
+    };
+
+    const results = await Promise.all([
+      processQueuePayload(payload, contextFor(env), "lease_one"),
+      processQueuePayload(payload, contextFor(env), "lease_two"),
+    ]);
+
+    expect(results.map((result) => result.status).sort()).toEqual(["completed", "retry_later"]);
+    expect(await repository.listProviderAttempts(queued.id)).toHaveLength(1);
+    expect(await repository.getQueueDelivery(payload.dedupeKey)).toMatchObject({
+      status: "completed",
+      attemptCount: 1,
+    });
+  });
+
+  it("recovers an expired queue delivery lease", async () => {
+    const { env, repository } = await createEnv();
+    const completed = makeStoredJob({ id: "job_expired_queue_lease" });
+    await repository.insertJob(completed);
+    const payload: QueuePayload = {
+      kind: "reconcile_stuck_job",
+      jobId: completed.id,
+      requestId: "req_expired_queue_lease",
+      dedupeKey: "expired-queue-lease",
+    };
+    await repository.claimQueueDelivery({
+      dedupeKey: payload.dedupeKey,
+      leaseOwner: "crashed-worker",
+      now: "2020-01-01T00:00:00.000Z",
+      leaseExpiresAt: "2020-01-01T00:01:00.000Z",
+      maxAttempts: 5,
+    });
+
+    await expect(
+      processQueuePayload(payload, contextFor(env), "recovery-worker"),
+    ).resolves.toMatchObject({ status: "completed" });
+    expect(await repository.getQueueDelivery(payload.dedupeKey)).toMatchObject({
+      status: "completed",
+      attemptCount: 2,
+    });
+  });
+
+  it("atomically claims scheduled tasks and recovers expired leases", async () => {
+    const { repository } = await createEnv();
+    const task: ScheduledTask = {
+      id: "task_atomic",
+      kind: "reconcile_stuck_job",
+      jobId: "job_atomic",
+      payload: {
+        kind: "reconcile_stuck_job",
+        jobId: "job_atomic",
+        requestId: "req_atomic",
+        dedupeKey: "task-atomic-claim",
+      },
+      runAt: "2020-01-01T00:00:00.000Z",
+      status: "pending",
+      attempts: 0,
+      dedupeKey: "task-atomic-claim",
+      createdAt: "2020-01-01T00:00:00.000Z",
+      updatedAt: "2020-01-01T00:00:00.000Z",
+    };
+    await repository.scheduleTask(task);
+
+    const [first, second] = await Promise.all([
+      repository.claimDueScheduledTasks(
+        "2020-01-01T00:00:01.000Z",
+        10,
+        "scheduler-one",
+        "2020-01-01T00:01:00.000Z",
+      ),
+      repository.claimDueScheduledTasks(
+        "2020-01-01T00:00:01.000Z",
+        10,
+        "scheduler-two",
+        "2020-01-01T00:01:00.000Z",
+      ),
+    ]);
+    expect(first.length + second.length).toBe(1);
+
+    const recovered = await repository.claimDueScheduledTasks(
+      "2020-01-01T00:02:00.000Z",
+      10,
+      "scheduler-recovery",
+      "2020-01-01T00:03:00.000Z",
+    );
+    expect(recovered).toHaveLength(1);
+    expect(recovered[0]).toMatchObject({ leaseOwner: "scheduler-recovery", attempts: 2 });
+  });
+
+  it("recovers a webhook left delivering after a worker crash", async () => {
+    let deliveredEventId = "";
+    const fetcher: typeof fetch = async (_input, init) => {
+      deliveredEventId = new Headers(init?.headers).get("EliteConverter-Event-Id") ?? "";
+      return new Response(null, { status: 204 });
+    };
+    const { env, repository } = await createEnv({
+      TEST_FETCH: fetcher,
+      CLIENT_WEBHOOK_MAX_ATTEMPTS: "3",
+    });
+    const job = makeStoredJob({ id: "job_stale_webhook" });
+    await repository.insertJob(job);
+    const event = makeWebhookEvent(
+      job.id,
+      "evt_stale_delivery",
+      "https://callbacks.example.com/hook",
+      {
+        status: "delivering",
+        attemptCount: 1,
+        leaseOwner: "crashed-worker",
+        leaseExpiresAt: "2020-01-01T00:00:00.000Z",
+      },
+    );
+
+    const recovered = await processWebhookEvent(event, env, repository);
+    expect(recovered).toMatchObject({ status: "delivered", attemptCount: 2 });
+    expect(recovered?.leaseOwner).toBeUndefined();
+    expect(deliveredEventId).toBe(event.eventId);
+  });
+
+  it.each([
+    {
+      name: "public redirect to private IP",
+      callbackUrl: "https://callbacks.example.com/private",
+      response: () =>
+        new Response(null, { status: 302, headers: { location: "http://127.0.0.1/hook" } }),
+      expected: "permanently_failed",
+    },
+    {
+      name: "redirect loop",
+      callbackUrl: "https://callbacks.example.com/loop",
+      response: () =>
+        new Response(null, {
+          status: 302,
+          headers: { location: "https://callbacks.example.com/loop" },
+        }),
+      expected: "permanently_failed",
+    },
+    {
+      name: "missing Location",
+      callbackUrl: "https://callbacks.example.com/missing",
+      response: () => new Response(null, { status: 302 }),
+      expected: "permanently_failed",
+    },
+  ])("rejects callback $name", async ({ callbackUrl, response, expected }) => {
+    const fetcher: typeof fetch = async (_input, init) => {
+      expect(init?.redirect).toBe("manual");
+      return response();
+    };
+    const { env, repository } = await createEnv({
+      TEST_FETCH: fetcher,
+      CLIENT_WEBHOOK_MAX_ATTEMPTS: "1",
+    });
+    const job = makeStoredJob({ id: `job_${callbackUrl.split("/").at(-1)}` });
+    await repository.insertJob(job);
+    const event = makeWebhookEvent(job.id, `evt_${job.id}`, callbackUrl);
+    expect(await processWebhookEvent(event, env, repository)).toMatchObject({
+      status: expected,
+      attemptCount: 1,
+    });
+  });
+
+  it("enforces callback redirect limit and accepts relative and public redirects", async () => {
+    const requested: string[] = [];
+    const fetcher: typeof fetch = async (input, init) => {
+      expect(init?.redirect).toBe("manual");
+      const url = String(input);
+      requested.push(url);
+      const parsed = new URL(url);
+      if (parsed.pathname.startsWith("/too-many/")) {
+        const hop = Number(parsed.pathname.split("/").at(-1));
+        return new Response(null, {
+          status: 302,
+          headers: { location: `/too-many/${hop + 1}` },
+        });
+      }
+      if (parsed.pathname === "/relative") {
+        return new Response(null, { status: 302, headers: { location: "/relative-target" } });
+      }
+      if (parsed.pathname === "/public") {
+        return new Response(null, {
+          status: 302,
+          headers: { location: "https://redirect.example.net/final" },
+        });
+      }
+      return new Response(null, { status: 204 });
+    };
+    const { env, repository } = await createEnv({
+      TEST_FETCH: fetcher,
+      CLIENT_WEBHOOK_MAX_ATTEMPTS: "1",
+    });
+    const job = makeStoredJob({ id: "job_redirect_cases" });
+    await repository.insertJob(job);
+
+    const tooMany = await processWebhookEvent(
+      makeWebhookEvent(job.id, "evt_too_many", "https://callbacks.example.com/too-many/0"),
+      env,
+      repository,
+    );
+    const relative = await processWebhookEvent(
+      makeWebhookEvent(job.id, "evt_relative", "https://callbacks.example.com/relative"),
+      env,
+      repository,
+    );
+    const publicRedirect = await processWebhookEvent(
+      makeWebhookEvent(job.id, "evt_public", "https://callbacks.example.com/public"),
+      env,
+      repository,
+    );
+
+    expect(tooMany?.status).toBe("permanently_failed");
+    expect(relative?.status).toBe("delivered");
+    expect(publicRedirect?.status).toBe("delivered");
+    expect(requested).toContain("https://callbacks.example.com/relative-target");
+    expect(requested).toContain("https://redirect.example.net/final");
+  });
+
   it("allows provider webhooks to win a race with fallback polling", async () => {
     const sent: QueuePayload[] = [];
     const queue = {
@@ -483,6 +897,306 @@ describe("EliteConverter API", () => {
     const completed = await repository.getJobByPublicId(created.data.jobId);
     expect(completed?.status).toBe("completed");
     expect(completed?.outputUrlPrivate).toContain("hook-token");
+  });
+
+  it("falls back after an accepted provider later fails", async () => {
+    const { env, rawKey, repository } = await createEnv({
+      ENABLED_PROVIDERS: "mock-a,mock-b",
+      PROVIDER_PRIORITY: "mock-a,mock-b",
+      MAX_PROVIDER_ATTEMPTS: "3",
+      MAX_RETRY_ATTEMPTS: "0",
+    });
+    const created = await createPrivateJob(
+      env,
+      rawKey,
+      "https://media.example.com/input.m3u8?mock-a=async-fail&mock-b=success",
+    );
+    if (!created.success) throw new Error("expected success");
+
+    const job = await repository.getJobByPublicId(created.data.jobId);
+    if (!job) throw new Error("expected job");
+    const attempts = await repository.listProviderAttempts(job.id);
+    const events = await repository.listJobEvents(job.id);
+    expect(job).toMatchObject({ status: "completed", providerId: "mock-b" });
+    expect(attempts.map((attempt) => [attempt.providerId, attempt.status])).toEqual([
+      ["mock-a", "failed"],
+      ["mock-b", "completed"],
+    ]);
+    expect(events.map((event) => event.type)).toContain("conversion.provider_fallback");
+  });
+
+  it("limits same-provider retries before selecting the fallback provider", async () => {
+    const { env, rawKey, repository } = await createEnv({
+      ENABLED_PROVIDERS: "mock-a,mock-b",
+      PROVIDER_PRIORITY: "mock-a,mock-b",
+      MAX_PROVIDER_ATTEMPTS: "3",
+      MAX_RETRY_ATTEMPTS: "1",
+    });
+    const created = await createPrivateJob(
+      env,
+      rawKey,
+      "https://media.example.com/input.m3u8?mock-a=async-fail&mock-b=success",
+    );
+    if (!created.success) throw new Error("expected success");
+    const job = await repository.getJobByPublicId(created.data.jobId);
+    if (!job) throw new Error("expected job");
+    const attempts = await repository.listProviderAttempts(job.id);
+    const events = await repository.listJobEvents(job.id);
+
+    expect(attempts.map((attempt) => attempt.providerId)).toEqual(["mock-a", "mock-a", "mock-b"]);
+    expect(events.map((event) => event.type)).toContain("conversion.provider_retry");
+    expect(job).toMatchObject({ status: "completed", providerId: "mock-b" });
+  });
+
+  it("does not fall back for permanent asynchronous provider errors", async () => {
+    const { env, rawKey, repository } = await createEnv({
+      ENABLED_PROVIDERS: "mock-a,mock-b",
+      PROVIDER_PRIORITY: "mock-a,mock-b",
+      MAX_PROVIDER_ATTEMPTS: "3",
+      MAX_RETRY_ATTEMPTS: "1",
+    });
+    const created = await createPrivateJob(
+      env,
+      rawKey,
+      "https://media.example.com/input.m3u8?mock-a=permanent&mock-b=success",
+    );
+    if (!created.success) throw new Error("expected success");
+    const job = await repository.getJobByPublicId(created.data.jobId);
+    if (!job) throw new Error("expected job");
+
+    expect(job.status).toBe("failed");
+    expect(
+      (await repository.listProviderAttempts(job.id)).map((attempt) => attempt.providerId),
+    ).toEqual(["mock-a"]);
+  });
+
+  it("fails cleanly when all asynchronous fallback providers are exhausted", async () => {
+    const { env, rawKey, repository } = await createEnv({
+      ENABLED_PROVIDERS: "mock-a,mock-b",
+      PROVIDER_PRIORITY: "mock-a,mock-b",
+      MAX_PROVIDER_ATTEMPTS: "2",
+      MAX_RETRY_ATTEMPTS: "0",
+    });
+    const created = await createPrivateJob(
+      env,
+      rawKey,
+      "https://media.example.com/input.m3u8?mock-a=async-fail&mock-b=async-fail",
+    );
+    if (!created.success) throw new Error("expected success");
+
+    const job = await repository.getJobByPublicId(created.data.jobId);
+    if (!job) throw new Error("expected job");
+    expect(job.status).toBe("failed");
+    expect(await repository.listProviderAttempts(job.id)).toHaveLength(2);
+  });
+
+  it("does not submit a fallback provider after cancellation", async () => {
+    const sent: QueuePayload[] = [];
+    const queue = {
+      send: async (payload: QueuePayload) => {
+        sent.push(payload);
+      },
+    } as unknown as Queue<QueuePayload>;
+    const { env, rawKey, repository } = await createEnv({
+      CONVERSION_QUEUE: queue,
+      ENABLED_PROVIDERS: "mock-a,mock-b",
+      PROVIDER_PRIORITY: "mock-a,mock-b",
+      MAX_PROVIDER_ATTEMPTS: "3",
+      MAX_RETRY_ATTEMPTS: "0",
+    });
+    const created = await createPrivateJob(
+      env,
+      rawKey,
+      "https://media.example.com/input.m3u8?mock-a=async-fail&mock-b=success",
+    );
+    if (!created.success) throw new Error("expected success");
+    const context = contextFor(env);
+    const submit = sent.find((payload) => payload.kind === "submit_provider_job");
+    if (!submit) throw new Error("expected submit");
+    await processQueuePayload(submit, context);
+    const poll = sent.find((payload) => payload.kind === "poll_provider_job");
+    if (!poll) throw new Error("expected poll");
+    await processQueuePayload(poll, context);
+    const fallback = sent.find(
+      (payload) => payload.kind === "submit_provider_job" && payload.dedupeKey.includes("fallback"),
+    );
+    if (!fallback) throw new Error("expected fallback");
+
+    const beforeCancel = await repository.getJobByPublicId(created.data.jobId);
+    if (!beforeCancel) throw new Error("expected job");
+    await cancelStoredJob(beforeCancel, context);
+    await processQueuePayload(fallback, context);
+
+    const cancelled = await repository.getJobById(beforeCancel.id);
+    expect(cancelled?.status).toBe("cancelled");
+    expect(
+      (await repository.listProviderAttempts(beforeCancel.id)).map((item) => item.providerId),
+    ).toEqual(["mock-a"]);
+  });
+
+  it("deduplicates a provider webhook and poll race during fallback", async () => {
+    const sent: QueuePayload[] = [];
+    const queue = {
+      send: async (payload: QueuePayload) => {
+        sent.push(payload);
+      },
+    } as unknown as Queue<QueuePayload>;
+    const { env, rawKey, repository } = await createEnv({
+      CONVERSION_QUEUE: queue,
+      ENABLED_PROVIDERS: "mock-a,mock-b",
+      PROVIDER_PRIORITY: "mock-a,mock-b",
+      MAX_PROVIDER_ATTEMPTS: "3",
+      MAX_RETRY_ATTEMPTS: "0",
+    });
+    const created = await createPrivateJob(
+      env,
+      rawKey,
+      "https://media.example.com/input.m3u8?mock-a=async-fail&mock-b=success",
+    );
+    if (!created.success) throw new Error("expected success");
+    const context = contextFor(env);
+    const submit = sent.find((payload) => payload.kind === "submit_provider_job");
+    if (!submit) throw new Error("expected submit");
+    await processQueuePayload(submit, context);
+    const processing = await repository.getJobByPublicId(created.data.jobId);
+    const poll = sent.find((payload) => payload.kind === "poll_provider_job");
+    if (!processing?.providerJobId || !poll) throw new Error("expected active provider job");
+
+    await Promise.all([
+      processQueuePayload(poll, context),
+      app.fetch(
+        request("/api/v1/webhooks/providers/mock-a", {
+          method: "POST",
+          body: JSON.stringify({
+            eventId: "evt_fallback_race",
+            providerJobId: processing.providerJobId,
+            status: "failed",
+            errorCode: "provider_temporary_failure",
+            retryable: true,
+          }),
+        }),
+        env,
+      ),
+    ]);
+    const fallbacks = sent.filter(
+      (payload) => payload.kind === "submit_provider_job" && payload.dedupeKey.includes("fallback"),
+    );
+    expect(fallbacks.length).toBeGreaterThan(0);
+    await Promise.all(
+      fallbacks.map((payload, index) =>
+        processQueuePayload(payload, context, `fallback-race-${index}`),
+      ),
+    );
+    const fallbackPoll = [...sent]
+      .reverse()
+      .find(
+        (payload) => payload.kind === "poll_provider_job" && payload.dedupeKey !== poll.dedupeKey,
+      );
+    if (!fallbackPoll) throw new Error("expected fallback poll");
+    await processQueuePayload(fallbackPoll, context);
+
+    const completed = await repository.getJobById(processing.id);
+    const attempts = await repository.listProviderAttempts(processing.id);
+    expect(completed).toMatchObject({ status: "completed", providerId: "mock-b" });
+    expect(attempts.filter((attempt) => attempt.providerId === "mock-b")).toHaveLength(1);
+  });
+
+  it("returns an existing valid download and genuinely refreshes an expired one", async () => {
+    const { env, repository } = await createEnv();
+    const valid = makeStoredJob({
+      id: "job_valid_download",
+      providerId: "mock",
+      providerJobId: "mock_valid",
+      outputUrlPrivate: "https://downloads.example.com/current.mp4?token=current",
+      outputUrlExpiresAt: new Date(Date.now() + 60_000).toISOString(),
+      outputMimeType: "video/mp4",
+    });
+    const expired = makeStoredJob({
+      id: "job_expired_download",
+      publicId: "ec_job_expired_download",
+      providerId: "mock",
+      providerJobId: "mock_expired",
+      outputUrlPrivate: "https://downloads.example.com/expired.mp4?token=expired",
+      outputUrlExpiresAt: new Date(Date.now() - 60_000).toISOString(),
+      outputMimeType: "video/mp4",
+    });
+    await repository.insertJob(valid);
+    await repository.insertJob(expired);
+
+    const unchanged = await refreshDownloadByInternalId(valid.id, contextFor(env));
+    const refreshed = await refreshDownloadByInternalId(expired.id, contextFor(env));
+    expect(unchanged.outputUrlPrivate).toBe(valid.outputUrlPrivate);
+    expect(refreshed.outputUrlPrivate).not.toBe(expired.outputUrlPrivate);
+    expect(refreshed.outputUrlPrivate).toContain("mock_expired");
+    expect(refreshed.outputUrlRedacted).toContain("%3Credacted%3E");
+  });
+
+  it("returns output_expired when a provider cannot regenerate a download", async () => {
+    const { env, repository } = await createEnv({
+      ENABLED_PROVIDERS: "generic",
+      PROVIDER_PRIORITY: "generic",
+      GENERIC_PROVIDER_BASE_URL: "https://provider.example.com",
+      GENERIC_PROVIDER_API_KEY: "provider-key",
+      GENERIC_PROVIDER_REFRESH_PATH: "",
+    });
+    const expired = makeStoredJob({
+      id: "job_no_refresh",
+      providerId: "generic",
+      providerJobId: "generic_job",
+      outputUrlPrivate: "https://downloads.example.com/expired.mp4?token=expired",
+      outputUrlExpiresAt: new Date(Date.now() - 60_000).toISOString(),
+    });
+    await repository.insertJob(expired);
+
+    await expect(refreshDownloadByInternalId(expired.id, contextFor(env))).rejects.toMatchObject({
+      publicError: { code: "output_expired" },
+    });
+  });
+
+  it("returns output_expired when the converted provider file was deleted", async () => {
+    const fetcher: typeof fetch = async (input) => {
+      if (String(input).includes("/download")) return new Response(null, { status: 404 });
+      return new Response(null, { status: 204 });
+    };
+    const { env, repository } = await createEnv({
+      ENABLED_PROVIDERS: "generic",
+      PROVIDER_PRIORITY: "generic",
+      GENERIC_PROVIDER_BASE_URL: "https://provider.example.com",
+      GENERIC_PROVIDER_API_KEY: "provider-key",
+      GENERIC_PROVIDER_REFRESH_PATH: "/jobs/{id}/download",
+      TEST_FETCH: fetcher,
+    });
+    const expired = makeStoredJob({
+      id: "job_deleted_output",
+      providerId: "generic",
+      providerJobId: "generic_deleted",
+      outputUrlPrivate: "https://downloads.example.com/deleted.mp4",
+      outputUrlExpiresAt: new Date(Date.now() - 60_000).toISOString(),
+    });
+    await repository.insertJob(expired);
+
+    await expect(refreshDownloadByInternalId(expired.id, contextFor(env))).rejects.toMatchObject({
+      publicError: { code: "output_expired" },
+    });
+  });
+
+  it("rejects unauthorized download refresh requests", async () => {
+    const { env, repository } = await createEnv();
+    const expired = makeStoredJob({
+      id: "job_unauthorized_refresh",
+      publicId: "ec_job_unauthorized_refresh",
+      apiKeyId: "key_test",
+      providerId: "mock",
+      providerJobId: "mock_unauthorized",
+      outputUrlPrivate: "https://downloads.example.com/expired.mp4",
+      outputUrlExpiresAt: new Date(Date.now() - 60_000).toISOString(),
+    });
+    await repository.insertJob(expired);
+    const response = await app.fetch(
+      request(`/api/v1/conversions/${expired.publicId}/refresh-download`, { method: "POST" }),
+      env,
+    );
+    expect(response.status).toBe(401);
   });
 
   it("retries client webhooks and records final failure state durably", async () => {

@@ -10,7 +10,10 @@ import type { AppConfig } from "./types";
 export const getProviders = (config: AppConfig): ConversionProvider[] => {
   const providers = new Map<string, ConversionProvider>();
 
-  if (config.appEnv === "production" && config.enabledProviders.includes("mock")) {
+  if (
+    config.appEnv === "production" &&
+    config.enabledProviders.some((providerId) => providerId.startsWith("mock"))
+  ) {
     throw new PublicApiError(
       "internal_configuration_error",
       500,
@@ -18,10 +21,14 @@ export const getProviders = (config: AppConfig): ConversionProvider[] => {
     );
   }
 
-  if (config.enabledProviders.includes("mock")) {
+  for (const providerId of config.enabledProviders.filter((candidate) =>
+    candidate.startsWith("mock"),
+  )) {
     providers.set(
-      "mock",
+      providerId,
       new MockProvider({
+        id: providerId,
+        displayName: providerId === "mock" ? "Mock Provider" : `Mock Provider ${providerId}`,
         formats: config.mockProviderFormats,
         qualities: config.mockProviderQualities,
       }),
@@ -57,6 +64,7 @@ export const getProviders = (config: AppConfig): ConversionProvider[] => {
         cancelPath: config.genericProvider.cancelPath,
         refreshPath: config.genericProvider.refreshPath,
         webhookSecret: config.genericProvider.webhookSecret,
+        sourceExtensions: config.genericProvider.sourceExtensions,
         timeoutMs: config.genericProvider.timeoutMs,
         enabled: true,
         priority: 10,

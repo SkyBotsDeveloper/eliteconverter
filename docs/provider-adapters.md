@@ -36,6 +36,7 @@ The generic provider is configured by environment variables:
 - `GENERIC_PROVIDER_CANCEL_PATH`
 - `GENERIC_PROVIDER_REFRESH_PATH`
 - `GENERIC_PROVIDER_WEBHOOK_SECRET`
+- `GENERIC_PROVIDER_SOURCE_EXTENSIONS` (M3U8 must remain absent until real staging verification)
 - `GENERIC_PROVIDER_TIMEOUT_MS`
 
 The default field mapping expects:
@@ -61,9 +62,10 @@ Configure it with:
 - `CLOUDCONVERT_API_KEY` as a Worker secret
 - `CLOUDCONVERT_WEBHOOK_SIGNING_SECRET` as a Worker secret when provider webhooks are enabled
 - `CLOUDCONVERT_FORMATS` for enabled output formats
-- `CLOUDCONVERT_QUALITIES` for enabled quality modes. The default is `source` because the adapter
-  does not apply provider-specific transcoding presets for resolution changes.
+- `CLOUDCONVERT_QUALITIES` for enabled quality modes. Video resolution presets use CloudConvert's
+  documented `width` and `height` conversion options. Audio-only is available only with MP3/M4A.
 
-The adapter is disabled by default and is not a claim that arbitrary M3U8 sources will convert
-successfully. Use CloudConvert sandbox/paid credentials and permitted input media to verify the
-exact formats and source URLs required for a production account.
+The adapter requires an ordinary source filename extension and rejects M3U8. CloudConvert documents
+that `export/url` tasks and URLs are deleted after 24 hours, so this adapter also reports download
+refresh as unsupported. Use an authorized provider or dedicated external FFmpeg service for HLS,
+then run the credential-gated real-provider test before enabling M3U8 in production.

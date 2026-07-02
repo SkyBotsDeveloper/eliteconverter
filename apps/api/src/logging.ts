@@ -1,4 +1,4 @@
-import { redactUrl } from "@eliteconverter/shared";
+import { redactUrl, sanitizeDiagnostic } from "@eliteconverter/shared";
 
 export interface LogFields {
   requestId?: string;
@@ -26,6 +26,8 @@ const redactLogFields = (fields: Record<string, unknown>): Record<string, unknow
   for (const [key, value] of Object.entries(fields)) {
     if (/authorization|cookie|api[-_]?key|token|secret|signature/i.test(key)) {
       redacted[key] = "<redacted>";
+    } else if (key === "message" && typeof value === "string") {
+      redacted[key] = sanitizeDiagnostic(value);
     } else if (typeof value === "string" && /^https?:\/\//.test(value)) {
       redacted[key] = redactUrl(value);
     } else {

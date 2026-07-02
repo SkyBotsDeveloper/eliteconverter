@@ -260,6 +260,7 @@ export const handleQueueBatch = async (
   const config = getConfig(env);
   const repository = getRepository(env);
   for (const message of batch.messages) {
+    const leaseOwner = randomId("lease", 16);
     const context: RequestContext = {
       requestId: message.body.requestId,
       env,
@@ -268,23 +269,32 @@ export const handleQueueBatch = async (
       fetcher: env.TEST_FETCH ?? fetch,
     };
     try {
-      await processQueuePayload(message.body, context);
-      await repository.completeScheduledTask(message.body.dedupeKey);
-      message.ack();
-    } catch (error) {
-      const publicError = error instanceof PublicApiError ? error.publicError : undefined;
-      if (publicError?.retryable) {
+      const result = await processQueuePayload(message.body, context, leaseOwner);
+      if (result.status === "retry_later") {
         message.retry();
-      } else {
+        continue;
+      }
+      await repository.completeScheduledTask(message.body.dedupeKey);
+      if (result.status === "permanent_failure") {
         logError({
           requestId: message.body.requestId,
           jobId: message.body.jobId,
-          errorCode: publicError?.code ?? "internal_error",
-          message: error instanceof Error ? error.message : String(error),
+          errorCode:
+            result.error instanceof PublicApiError
+              ? result.error.publicError.code
+              : "internal_error",
+          message: result.error instanceof Error ? result.error.message : "Permanent queue failure",
         });
-        await repository.completeScheduledTask(message.body.dedupeKey);
-        message.ack();
       }
+      message.ack();
+    } catch (error) {
+      logError({
+        requestId: message.body.requestId,
+        jobId: message.body.jobId,
+        errorCode: error instanceof PublicApiError ? error.publicError.code : "internal_error",
+        message: error instanceof Error ? error.message : String(error),
+      });
+      message.retry();
     }
   }
 };

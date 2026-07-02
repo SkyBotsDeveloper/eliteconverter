@@ -13,13 +13,19 @@ Research date: 2026-07-02.
 - Limits and pricing: CloudConvert documents sandbox mode and pricing/credits publicly, but actual
   production quotas depend on the account plan.
 - Supported formats: CloudConvert documents broad file conversion support. EliteConverter enables
-  only configured output formats for this adapter, defaulting to `mp4,webm,mkv`, and source-only
-  quality because this adapter does not define provider-specific resolution presets.
+  only configured output formats. The adapter maps video presets to documented numeric `width` and
+  `height` options and restricts audio-only quality to MP3/M4A output.
+- Source handling: `import/url` imports a file and accepts a filename. The adapter requires a
+  recognized source filename extension and deliberately excludes M3U8. No permitted, real M3U8
+  conversion has succeeded, so CloudConvert is not advertised as an HLS provider.
+- Output lifetime: CloudConvert documents that `export/url` URLs and their tasks are deleted after
+  24 hours. Because the converted task is temporary as well, the adapter does not claim that an
+  expired CloudConvert URL can be regenerated.
 - Integration result: added a dedicated opt-in `CloudConvertProvider`. It is disabled unless
   `ENABLED_PROVIDERS` includes `cloudconvert` and `CLOUDCONVERT_API_KEY` is supplied as a Worker
   secret.
-- Verification status: only mocked adapter contract tests were run. No real authorized M3U8
-  conversion was executed.
+- Verification status: mocked adapter contract tests cover capabilities, quality mapping and
+  output expiry metadata. No real authorized M3U8 conversion was executed.
 
 ## ConvertAPI
 
@@ -44,7 +50,7 @@ Research date: 2026-07-02.
 
 ## Conclusion
 
-CloudConvert has the clearest documented async job/task model for this repository's adapter shape,
-so EliteConverter now includes a dedicated CloudConvert adapter. Real production conversion still
-requires provider credentials, configured Cloudflare secrets and a permitted source URL test. Mock
-mode remains for local development and automated tests.
+CloudConvert has a documented async job/task model for ordinary media files, so EliteConverter
+includes a dedicated opt-in adapter for those files. Real M3U8 production support still requires a
+different authorized provider or external FFmpeg service plus a successful staging verification.
+Mock mode remains for local development and automated tests.

@@ -166,6 +166,13 @@ const demoCapabilities: CapabilitiesResponse = {
   tagline: "Convert Streams. Deliver Anywhere.",
   formats: ["mp4", "webm", "mkv", "mp3", "m4a"],
   qualities: ["source", "1080p", "720p", "480p", "audio"],
+  qualityFormats: {
+    source: ["mp4", "webm", "mkv", "mp3", "m4a"],
+    "1080p": ["mp4", "webm", "mkv"],
+    "720p": ["mp4", "webm", "mkv"],
+    "480p": ["mp4", "webm", "mkv"],
+    audio: ["mp3", "m4a"],
+  },
   providers: [
     {
       id: "mock",
@@ -225,7 +232,7 @@ const demoJob = (jobId: string): PublicJob => {
     currentStage: "completed",
     format: "mp4",
     quality: "source",
-    inputUrlRedacted: "https://media.example.com/master.m3u8",
+    inputUrlRedacted: "https://media.example.com/input.mp4",
     sourceHostname: "media.example.com",
     createdAt: now,
     updatedAt: now,

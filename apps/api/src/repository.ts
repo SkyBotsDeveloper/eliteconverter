@@ -2,6 +2,7 @@ import type { CircuitBreakerSnapshot, JobEvent, PublicErrorCode } from "@eliteco
 import type {
   ClientWebhookEvent,
   Env,
+  QueueDelivery,
   ScheduledTask,
   StoredApiKey,
   StoredIncident,
@@ -34,6 +35,7 @@ export interface Repository {
   addJobEvent(event: JobEvent): Promise<void>;
   listJobEvents(jobId: string): Promise<JobEvent[]>;
   addProviderAttempt(attempt: StoredProviderAttempt): Promise<void>;
+  listProviderAttempts(jobId: string): Promise<StoredProviderAttempt[]>;
   getProviderHealth(providerId: string): Promise<CircuitBreakerSnapshot | undefined>;
   setProviderHealth(snapshot: CircuitBreakerSnapshot): Promise<void>;
   recordProviderWebhookEvent(input: {
@@ -62,12 +64,38 @@ export interface Repository {
   listClientWebhookEventsForJob(jobId: string): Promise<ClientWebhookEvent[]>;
   updateClientWebhookEvent(event: ClientWebhookEvent): Promise<void>;
   listDueClientWebhookEvents(now: string, limit: number): Promise<ClientWebhookEvent[]>;
+  claimClientWebhookEvent(
+    eventId: string,
+    leaseOwner: string,
+    now: string,
+    leaseExpiresAt: string,
+    maxAttempts: number,
+  ): Promise<ClientWebhookEvent | undefined>;
   scheduleTask(task: ScheduledTask): Promise<void>;
-  claimDueScheduledTasks(now: string, limit: number): Promise<ScheduledTask[]>;
-  completeScheduledTask(dedupeKey: string): Promise<void>;
-  failScheduledTask(dedupeKey: string, error: string): Promise<void>;
-  hasProcessedQueueDelivery(dedupeKey: string): Promise<boolean>;
-  markQueueDeliveryProcessed(dedupeKey: string): Promise<void>;
+  claimDueScheduledTasks(
+    now: string,
+    limit: number,
+    leaseOwner: string,
+    leaseExpiresAt: string,
+  ): Promise<ScheduledTask[]>;
+  completeScheduledTask(dedupeKey: string, leaseOwner?: string): Promise<void>;
+  failScheduledTask(dedupeKey: string, error: string, leaseOwner?: string): Promise<void>;
+  getScheduledTask(dedupeKey: string): Promise<ScheduledTask | undefined>;
+  claimQueueDelivery(input: {
+    dedupeKey: string;
+    leaseOwner: string;
+    now: string;
+    leaseExpiresAt: string;
+    maxAttempts: number;
+  }): Promise<QueueDelivery | undefined>;
+  completeQueueDelivery(dedupeKey: string, leaseOwner: string): Promise<void>;
+  failQueueDelivery(
+    dedupeKey: string,
+    leaseOwner: string,
+    error: string,
+    retryable: boolean,
+  ): Promise<QueueDelivery | undefined>;
+  getQueueDelivery(dedupeKey: string): Promise<QueueDelivery | undefined>;
   listActiveJobs(): Promise<StoredJob[]>;
   listStuckJobs(before: string): Promise<StoredJob[]>;
   listIncidents(): Promise<StoredIncident[]>;
@@ -82,10 +110,11 @@ export class MemoryRepository implements Repository {
   private readonly events = new Map<string, JobEvent[]>();
   private readonly idempotency = new Map<string, { fingerprint: string; jobId: string }>();
   private readonly providerHealth = new Map<string, CircuitBreakerSnapshot>();
+  private readonly providerAttempts = new Map<string, StoredProviderAttempt[]>();
   private readonly providerWebhookEvents = new Set<string>();
   private readonly clientWebhookEvents = new Map<string, ClientWebhookEvent>();
   private readonly scheduledTasks = new Map<string, ScheduledTask>();
-  private readonly processedQueueDeliveries = new Set<string>();
+  private readonly queueDeliveries = new Map<string, QueueDelivery>();
   private readonly incidents = new Map<string, StoredIncident>();
 
   async insertApiKey(key: StoredApiKey): Promise<void> {
@@ -174,8 +203,16 @@ export class MemoryRepository implements Repository {
     return this.events.get(jobId) ?? [];
   }
 
-  async addProviderAttempt(_attempt: StoredProviderAttempt): Promise<void> {
-    return;
+  async addProviderAttempt(attempt: StoredProviderAttempt): Promise<void> {
+    const attempts = this.providerAttempts.get(attempt.jobId) ?? [];
+    this.providerAttempts.set(attempt.jobId, [
+      ...attempts.filter((existing) => existing.id !== attempt.id),
+      attempt,
+    ]);
+  }
+
+  async listProviderAttempts(jobId: string): Promise<StoredProviderAttempt[]> {
+    return this.providerAttempts.get(jobId) ?? [];
   }
 
   async getProviderHealth(providerId: string): Promise<CircuitBreakerSnapshot | undefined> {
@@ -222,48 +259,101 @@ export class MemoryRepository implements Repository {
     return [...this.clientWebhookEvents.values()]
       .filter(
         (event) =>
-          (event.status === "pending" || event.status === "retrying") &&
-          (!event.nextAttemptAt || event.nextAttemptAt <= now),
+          ((event.status === "pending" || event.status === "retrying") &&
+            (!event.nextAttemptAt || event.nextAttemptAt <= now)) ||
+          (event.status === "delivering" &&
+            event.leaseExpiresAt !== undefined &&
+            event.leaseExpiresAt <= now),
       )
       .slice(0, limit);
+  }
+
+  async claimClientWebhookEvent(
+    eventId: string,
+    leaseOwner: string,
+    now: string,
+    leaseExpiresAt: string,
+    maxAttempts: number,
+  ): Promise<ClientWebhookEvent | undefined> {
+    const event = this.clientWebhookEvents.get(eventId);
+    if (!event || event.status === "delivered" || event.status === "permanently_failed") {
+      return undefined;
+    }
+    const due =
+      ((event.status === "pending" || event.status === "retrying") &&
+        (!event.nextAttemptAt || event.nextAttemptAt <= now)) ||
+      (event.status === "delivering" &&
+        event.leaseExpiresAt !== undefined &&
+        event.leaseExpiresAt <= now);
+    if (!due || event.attemptCount >= maxAttempts) return undefined;
+    const claimed = {
+      ...event,
+      status: "delivering" as const,
+      attemptCount: event.attemptCount + 1,
+      leaseOwner,
+      leaseExpiresAt,
+      updatedAt: now,
+    };
+    this.clientWebhookEvents.set(eventId, claimed);
+    return claimed;
   }
 
   async scheduleTask(task: ScheduledTask): Promise<void> {
     if (!this.scheduledTasks.has(task.dedupeKey)) this.scheduledTasks.set(task.dedupeKey, task);
   }
 
-  async claimDueScheduledTasks(now: string, limit: number): Promise<ScheduledTask[]> {
+  async claimDueScheduledTasks(
+    now: string,
+    limit: number,
+    leaseOwner: string,
+    leaseExpiresAt: string,
+  ): Promise<ScheduledTask[]> {
     const due = [...this.scheduledTasks.values()]
-      .filter((task) => task.status === "pending" && task.runAt <= now)
+      .filter(
+        (task) =>
+          (task.status === "pending" && task.runAt <= now) ||
+          (task.status === "processing" &&
+            task.leaseExpiresAt !== undefined &&
+            task.leaseExpiresAt <= now),
+      )
       .sort((left, right) => left.runAt.localeCompare(right.runAt))
       .slice(0, limit);
-    for (const task of due) {
-      this.scheduledTasks.set(task.dedupeKey, {
+    const claimed = due.map((task) => {
+      const next = {
         ...task,
-        status: "processing",
+        status: "processing" as const,
         attempts: task.attempts + 1,
+        leaseOwner,
+        leaseExpiresAt,
         updatedAt: now,
-      });
-    }
-    return due;
+      };
+      this.scheduledTasks.set(task.dedupeKey, next);
+      return next;
+    });
+    return claimed;
   }
 
-  async completeScheduledTask(dedupeKey: string): Promise<void> {
+  async completeScheduledTask(dedupeKey: string, leaseOwner?: string): Promise<void> {
     const task = this.scheduledTasks.get(dedupeKey);
-    if (task)
+    if (task && (!leaseOwner || task.leaseOwner === leaseOwner))
       this.scheduledTasks.set(dedupeKey, {
         ...task,
         status: "completed",
+        leaseOwner: undefined,
+        leaseExpiresAt: undefined,
+        completedAt: new Date().toISOString(),
         updatedAt: new Date().toISOString(),
       });
   }
 
-  async failScheduledTask(dedupeKey: string, error: string): Promise<void> {
+  async failScheduledTask(dedupeKey: string, error: string, leaseOwner?: string): Promise<void> {
     const task = this.scheduledTasks.get(dedupeKey);
-    if (task) {
+    if (task && (!leaseOwner || task.leaseOwner === leaseOwner)) {
       this.scheduledTasks.set(dedupeKey, {
         ...task,
         status: "pending",
+        leaseOwner: undefined,
+        leaseExpiresAt: undefined,
         lastError: error,
         runAt: new Date(Date.now() + 60_000).toISOString(),
         updatedAt: new Date().toISOString(),
@@ -271,12 +361,78 @@ export class MemoryRepository implements Repository {
     }
   }
 
-  async hasProcessedQueueDelivery(dedupeKey: string): Promise<boolean> {
-    return this.processedQueueDeliveries.has(dedupeKey);
+  async getScheduledTask(dedupeKey: string): Promise<ScheduledTask | undefined> {
+    return this.scheduledTasks.get(dedupeKey);
   }
 
-  async markQueueDeliveryProcessed(dedupeKey: string): Promise<void> {
-    this.processedQueueDeliveries.add(dedupeKey);
+  async claimQueueDelivery(input: {
+    dedupeKey: string;
+    leaseOwner: string;
+    now: string;
+    leaseExpiresAt: string;
+    maxAttempts: number;
+  }): Promise<QueueDelivery | undefined> {
+    const existing = this.queueDeliveries.get(input.dedupeKey);
+    if (existing?.status === "completed") return undefined;
+    if (existing?.status === "failed") return undefined;
+    if (
+      existing?.status === "processing" &&
+      existing.leaseExpiresAt &&
+      existing.leaseExpiresAt > input.now
+    ) {
+      return undefined;
+    }
+    if ((existing?.attemptCount ?? 0) >= input.maxAttempts) return undefined;
+    const claimed: QueueDelivery = {
+      dedupeKey: input.dedupeKey,
+      status: "processing",
+      attemptCount: (existing?.attemptCount ?? 0) + 1,
+      leaseOwner: input.leaseOwner,
+      leaseExpiresAt: input.leaseExpiresAt,
+      lastError: existing?.lastError,
+      createdAt: existing?.createdAt ?? input.now,
+      updatedAt: input.now,
+    };
+    this.queueDeliveries.set(input.dedupeKey, claimed);
+    return claimed;
+  }
+
+  async completeQueueDelivery(dedupeKey: string, leaseOwner: string): Promise<void> {
+    const delivery = this.queueDeliveries.get(dedupeKey);
+    if (delivery?.leaseOwner !== leaseOwner) return;
+    const now = new Date().toISOString();
+    this.queueDeliveries.set(dedupeKey, {
+      ...delivery,
+      status: "completed",
+      leaseOwner: undefined,
+      leaseExpiresAt: undefined,
+      completedAt: now,
+      updatedAt: now,
+    });
+  }
+
+  async getQueueDelivery(dedupeKey: string): Promise<QueueDelivery | undefined> {
+    return this.queueDeliveries.get(dedupeKey);
+  }
+
+  async failQueueDelivery(
+    dedupeKey: string,
+    leaseOwner: string,
+    error: string,
+    retryable: boolean,
+  ): Promise<QueueDelivery | undefined> {
+    const delivery = this.queueDeliveries.get(dedupeKey);
+    if (delivery?.leaseOwner !== leaseOwner) return delivery;
+    const updated: QueueDelivery = {
+      ...delivery,
+      status: retryable ? "pending" : "failed",
+      leaseOwner: undefined,
+      leaseExpiresAt: undefined,
+      lastError: error,
+      updatedAt: new Date().toISOString(),
+    };
+    this.queueDeliveries.set(dedupeKey, updated);
+    return updated;
   }
 
   async listActiveJobs(): Promise<StoredJob[]> {
@@ -516,7 +672,7 @@ export class D1Repository implements Repository {
   async addProviderAttempt(attempt: StoredProviderAttempt): Promise<void> {
     await this.db
       .prepare(
-        "INSERT INTO provider_attempts (id, job_id, provider_id, status, attempt_number, provider_job_id, error_code, retryable, started_at, finished_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT OR REPLACE INTO provider_attempts (id, job_id, provider_id, status, attempt_number, provider_job_id, error_code, retryable, started_at, finished_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
       )
       .bind(
         attempt.id,
@@ -531,6 +687,14 @@ export class D1Repository implements Repository {
         attempt.finishedAt ?? null,
       )
       .run();
+  }
+
+  async listProviderAttempts(jobId: string): Promise<StoredProviderAttempt[]> {
+    const { results } = await this.db
+      .prepare("SELECT * FROM provider_attempts WHERE job_id = ? ORDER BY started_at ASC")
+      .bind(jobId)
+      .all<ProviderAttemptRow>();
+    return results.map(mapProviderAttempt);
   }
 
   async getProviderHealth(providerId: string): Promise<CircuitBreakerSnapshot | undefined> {
@@ -670,11 +834,13 @@ export class D1Repository implements Repository {
   async updateClientWebhookEvent(event: ClientWebhookEvent): Promise<void> {
     await this.db
       .prepare(
-        "UPDATE client_webhook_events SET status = ?, attempt_count = ?, last_status_code = ?, last_error = ?, next_attempt_at = ?, updated_at = ? WHERE event_id = ?",
+        "UPDATE client_webhook_events SET status = ?, attempt_count = ?, lease_owner = ?, lease_expires_at = ?, last_status_code = ?, last_error = ?, next_attempt_at = ?, updated_at = ? WHERE event_id = ?",
       )
       .bind(
         event.status,
         event.attemptCount,
+        event.leaseOwner ?? null,
+        event.leaseExpiresAt ?? null,
         event.lastStatusCode ?? null,
         event.lastError ?? null,
         event.nextAttemptAt ?? null,
@@ -687,17 +853,46 @@ export class D1Repository implements Repository {
   async listDueClientWebhookEvents(now: string, limit: number): Promise<ClientWebhookEvent[]> {
     const { results } = await this.db
       .prepare(
-        "SELECT * FROM client_webhook_events WHERE status IN ('pending','retrying') AND (next_attempt_at IS NULL OR next_attempt_at <= ?) ORDER BY created_at ASC LIMIT ?",
+        "SELECT * FROM client_webhook_events WHERE (status IN ('pending','retrying') AND (next_attempt_at IS NULL OR next_attempt_at <= ?)) OR (status = 'delivering' AND lease_expires_at IS NOT NULL AND lease_expires_at <= ?) ORDER BY created_at ASC LIMIT ?",
       )
-      .bind(now, limit)
+      .bind(now, now, limit)
       .all<ClientWebhookEventRow>();
     return results.map(mapClientWebhookEvent);
+  }
+
+  async claimClientWebhookEvent(
+    eventId: string,
+    leaseOwner: string,
+    now: string,
+    leaseExpiresAt: string,
+    maxAttempts: number,
+  ): Promise<ClientWebhookEvent | undefined> {
+    await this.db
+      .prepare(
+        `UPDATE client_webhook_events
+         SET status = 'delivering',
+             attempt_count = attempt_count + 1,
+             lease_owner = ?,
+             lease_expires_at = ?,
+             updated_at = ?
+         WHERE event_id = ?
+           AND status NOT IN ('delivered','permanently_failed')
+           AND attempt_count < ?
+           AND (
+             (status IN ('pending','retrying') AND (next_attempt_at IS NULL OR next_attempt_at <= ?))
+             OR (status = 'delivering' AND lease_expires_at IS NOT NULL AND lease_expires_at <= ?)
+           )`,
+      )
+      .bind(leaseOwner, leaseExpiresAt, now, eventId, maxAttempts, now, now)
+      .run();
+    const claimed = await this.getClientWebhookEvent(eventId);
+    return claimed?.leaseOwner === leaseOwner ? claimed : undefined;
   }
 
   async scheduleTask(task: ScheduledTask): Promise<void> {
     await this.db
       .prepare(
-        "INSERT OR IGNORE INTO scheduled_tasks (id, kind, job_id, payload_json, run_at, status, attempts, dedupe_key, last_error, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT OR IGNORE INTO scheduled_tasks (id, kind, job_id, payload_json, run_at, status, attempts, dedupe_key, lease_owner, lease_expires_at, last_error, completed_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
       )
       .bind(
         task.id,
@@ -708,64 +903,171 @@ export class D1Repository implements Repository {
         task.status,
         task.attempts,
         task.dedupeKey,
+        task.leaseOwner ?? null,
+        task.leaseExpiresAt ?? null,
         task.lastError ?? null,
+        task.completedAt ?? null,
         task.createdAt,
         task.updatedAt,
       )
       .run();
   }
 
-  async claimDueScheduledTasks(now: string, limit: number): Promise<ScheduledTask[]> {
+  async claimDueScheduledTasks(
+    now: string,
+    limit: number,
+    leaseOwner: string,
+    leaseExpiresAt: string,
+  ): Promise<ScheduledTask[]> {
     const { results } = await this.db
       .prepare(
-        "SELECT * FROM scheduled_tasks WHERE status = 'pending' AND run_at <= ? ORDER BY run_at ASC LIMIT ?",
+        "SELECT * FROM scheduled_tasks WHERE (status = 'pending' AND run_at <= ?) OR (status = 'processing' AND lease_expires_at IS NOT NULL AND lease_expires_at <= ?) ORDER BY run_at ASC LIMIT ?",
       )
-      .bind(now, limit)
+      .bind(now, now, limit)
       .all<ScheduledTaskRow>();
     for (const row of results) {
       await this.db
         .prepare(
-          "UPDATE scheduled_tasks SET status = 'processing', attempts = attempts + 1, updated_at = ? WHERE dedupe_key = ? AND status = 'pending'",
+          "UPDATE scheduled_tasks SET status = 'processing', attempts = attempts + 1, lease_owner = ?, lease_expires_at = ?, updated_at = ? WHERE dedupe_key = ? AND ((status = 'pending' AND run_at <= ?) OR (status = 'processing' AND lease_expires_at IS NOT NULL AND lease_expires_at <= ?))",
         )
-        .bind(now, row.dedupe_key)
+        .bind(leaseOwner, leaseExpiresAt, now, row.dedupe_key, now, now)
         .run();
     }
-    return results.map(mapScheduledTask);
+    const claimed = await Promise.all(
+      results.map(async (row) => {
+        const current = await this.db
+          .prepare("SELECT * FROM scheduled_tasks WHERE dedupe_key = ? LIMIT 1")
+          .bind(row.dedupe_key)
+          .first<ScheduledTaskRow>();
+        return current ? mapScheduledTask(current) : undefined;
+      }),
+    );
+    return claimed.filter(
+      (task): task is ScheduledTask => task !== undefined && task.leaseOwner === leaseOwner,
+    );
   }
 
-  async completeScheduledTask(dedupeKey: string): Promise<void> {
+  async completeScheduledTask(dedupeKey: string, leaseOwner?: string): Promise<void> {
+    const now = new Date().toISOString();
     await this.db
       .prepare(
-        "UPDATE scheduled_tasks SET status = 'completed', updated_at = ? WHERE dedupe_key = ?",
+        `UPDATE scheduled_tasks
+         SET status = 'completed', lease_owner = NULL, lease_expires_at = NULL,
+             completed_at = ?, updated_at = ?
+         WHERE dedupe_key = ? AND (? IS NULL OR lease_owner = ?)`,
       )
-      .bind(new Date().toISOString(), dedupeKey)
+      .bind(now, now, dedupeKey, leaseOwner ?? null, leaseOwner ?? null)
       .run();
   }
 
-  async failScheduledTask(dedupeKey: string, error: string): Promise<void> {
+  async failScheduledTask(dedupeKey: string, error: string, leaseOwner?: string): Promise<void> {
     await this.db
       .prepare(
-        "UPDATE scheduled_tasks SET status = 'pending', last_error = ?, run_at = ?, updated_at = ? WHERE dedupe_key = ?",
+        `UPDATE scheduled_tasks
+         SET status = 'pending', lease_owner = NULL, lease_expires_at = NULL, last_error = ?, run_at = ?, updated_at = ?
+         WHERE dedupe_key = ? AND (? IS NULL OR lease_owner = ?)`,
       )
-      .bind(error, new Date(Date.now() + 60_000).toISOString(), new Date().toISOString(), dedupeKey)
+      .bind(
+        error,
+        new Date(Date.now() + 60_000).toISOString(),
+        new Date().toISOString(),
+        dedupeKey,
+        leaseOwner ?? null,
+        leaseOwner ?? null,
+      )
       .run();
   }
 
-  async hasProcessedQueueDelivery(dedupeKey: string): Promise<boolean> {
+  async getScheduledTask(dedupeKey: string): Promise<ScheduledTask | undefined> {
     const row = await this.db
-      .prepare("SELECT dedupe_key FROM queue_message_deliveries WHERE dedupe_key = ? LIMIT 1")
+      .prepare("SELECT * FROM scheduled_tasks WHERE dedupe_key = ? LIMIT 1")
       .bind(dedupeKey)
-      .first<{ dedupe_key: string }>();
-    return Boolean(row);
+      .first<ScheduledTaskRow>();
+    return row ? mapScheduledTask(row) : undefined;
   }
 
-  async markQueueDeliveryProcessed(dedupeKey: string): Promise<void> {
+  async claimQueueDelivery(input: {
+    dedupeKey: string;
+    leaseOwner: string;
+    now: string;
+    leaseExpiresAt: string;
+    maxAttempts: number;
+  }): Promise<QueueDelivery | undefined> {
     await this.db
       .prepare(
-        "INSERT OR IGNORE INTO queue_message_deliveries (dedupe_key, processed_at) VALUES (?, ?)",
+        "INSERT OR IGNORE INTO queue_message_deliveries (dedupe_key, processed_at, status, attempt_count, created_at, updated_at) VALUES (?, ?, 'pending', 0, ?, ?)",
       )
-      .bind(dedupeKey, new Date().toISOString())
+      .bind(input.dedupeKey, "", input.now, input.now)
       .run();
+    await this.db
+      .prepare(
+        `UPDATE queue_message_deliveries
+         SET status = 'processing',
+             attempt_count = attempt_count + 1,
+             lease_owner = ?,
+             lease_expires_at = ?,
+             updated_at = ?
+         WHERE dedupe_key = ?
+           AND status <> 'completed'
+           AND attempt_count < ?
+           AND (
+             status = 'pending'
+             OR (status = 'processing' AND lease_expires_at IS NOT NULL AND lease_expires_at <= ?)
+           )`,
+      )
+      .bind(
+        input.leaseOwner,
+        input.leaseExpiresAt,
+        input.now,
+        input.dedupeKey,
+        input.maxAttempts,
+        input.now,
+      )
+      .run();
+    const row = await this.db
+      .prepare("SELECT * FROM queue_message_deliveries WHERE dedupe_key = ? LIMIT 1")
+      .bind(input.dedupeKey)
+      .first<QueueDeliveryRow>();
+    const delivery = row ? mapQueueDelivery(row) : undefined;
+    return delivery?.leaseOwner === input.leaseOwner ? delivery : undefined;
+  }
+
+  async completeQueueDelivery(dedupeKey: string, leaseOwner: string): Promise<void> {
+    const now = new Date().toISOString();
+    await this.db
+      .prepare(
+        "UPDATE queue_message_deliveries SET status = 'completed', processed_at = ?, completed_at = ?, lease_owner = NULL, lease_expires_at = NULL, updated_at = ? WHERE dedupe_key = ? AND lease_owner = ?",
+      )
+      .bind(now, now, now, dedupeKey, leaseOwner)
+      .run();
+  }
+
+  async getQueueDelivery(dedupeKey: string): Promise<QueueDelivery | undefined> {
+    const row = await this.db
+      .prepare("SELECT * FROM queue_message_deliveries WHERE dedupe_key = ? LIMIT 1")
+      .bind(dedupeKey)
+      .first<QueueDeliveryRow>();
+    return row ? mapQueueDelivery(row) : undefined;
+  }
+
+  async failQueueDelivery(
+    dedupeKey: string,
+    leaseOwner: string,
+    error: string,
+    retryable: boolean,
+  ): Promise<QueueDelivery | undefined> {
+    const nextStatus = retryable ? "pending" : "failed";
+    await this.db
+      .prepare(
+        "UPDATE queue_message_deliveries SET status = ?, lease_owner = NULL, lease_expires_at = NULL, last_error = ?, updated_at = ? WHERE dedupe_key = ? AND lease_owner = ?",
+      )
+      .bind(nextStatus, error, new Date().toISOString(), dedupeKey, leaseOwner)
+      .run();
+    const row = await this.db
+      .prepare("SELECT * FROM queue_message_deliveries WHERE dedupe_key = ? LIMIT 1")
+      .bind(dedupeKey)
+      .first<QueueDeliveryRow>();
+    return row ? mapQueueDelivery(row) : undefined;
   }
 
   async listActiveJobs(): Promise<StoredJob[]> {
@@ -900,7 +1202,22 @@ interface ScheduledTaskRow {
   status: ScheduledTask["status"];
   attempts: number;
   dedupe_key: string;
+  lease_owner: string | null;
+  lease_expires_at: string | null;
   last_error: string | null;
+  completed_at: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+interface QueueDeliveryRow {
+  dedupe_key: string;
+  status: QueueDelivery["status"];
+  attempt_count: number;
+  lease_owner: string | null;
+  lease_expires_at: string | null;
+  last_error: string | null;
+  completed_at: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -915,6 +1232,8 @@ interface ClientWebhookEventRow {
   callback_url_redacted: string;
   status: ClientWebhookEvent["status"];
   attempt_count: number;
+  lease_owner: string | null;
+  lease_expires_at: string | null;
   last_status_code: number | null;
   last_error: string | null;
   next_attempt_at: string | null;
@@ -940,6 +1259,19 @@ interface ProviderHealthRow {
   last_failure_at: string | null;
   cooldown_until: string | null;
   updated_at: string;
+}
+
+interface ProviderAttemptRow {
+  id: string;
+  job_id: string;
+  provider_id: string;
+  status: string;
+  attempt_number: number;
+  provider_job_id: string | null;
+  error_code: PublicErrorCode | null;
+  retryable: number;
+  started_at: string;
+  finished_at: string | null;
 }
 
 interface IncidentRow {
@@ -1028,6 +1360,19 @@ const mapProviderHealth = (row: ProviderHealthRow): CircuitBreakerSnapshot => ({
   updatedAt: row.updated_at,
 });
 
+const mapProviderAttempt = (row: ProviderAttemptRow): StoredProviderAttempt => ({
+  id: row.id,
+  jobId: row.job_id,
+  providerId: row.provider_id,
+  status: row.status,
+  attemptNumber: row.attempt_number,
+  providerJobId: row.provider_job_id ?? undefined,
+  errorCode: row.error_code ?? undefined,
+  retryable: Boolean(row.retryable),
+  startedAt: row.started_at,
+  finishedAt: row.finished_at ?? undefined,
+});
+
 const mapIncident = (row: IncidentRow): StoredIncident => ({
   id: row.id,
   title: row.title,
@@ -1048,7 +1393,22 @@ const mapScheduledTask = (row: ScheduledTaskRow): ScheduledTask => ({
   status: row.status,
   attempts: row.attempts,
   dedupeKey: row.dedupe_key,
+  leaseOwner: row.lease_owner ?? undefined,
+  leaseExpiresAt: row.lease_expires_at ?? undefined,
   lastError: row.last_error ?? undefined,
+  completedAt: row.completed_at ?? undefined,
+  createdAt: row.created_at,
+  updatedAt: row.updated_at,
+});
+
+const mapQueueDelivery = (row: QueueDeliveryRow): QueueDelivery => ({
+  dedupeKey: row.dedupe_key,
+  status: row.status,
+  attemptCount: row.attempt_count,
+  leaseOwner: row.lease_owner ?? undefined,
+  leaseExpiresAt: row.lease_expires_at ?? undefined,
+  lastError: row.last_error ?? undefined,
+  completedAt: row.completed_at ?? undefined,
   createdAt: row.created_at,
   updatedAt: row.updated_at,
 });
@@ -1063,6 +1423,8 @@ const mapClientWebhookEvent = (row: ClientWebhookEventRow): ClientWebhookEvent =
   callbackUrlRedacted: row.callback_url_redacted,
   status: row.status,
   attemptCount: row.attempt_count,
+  leaseOwner: row.lease_owner ?? undefined,
+  leaseExpiresAt: row.lease_expires_at ?? undefined,
   lastStatusCode: row.last_status_code ?? undefined,
   lastError: row.last_error ?? undefined,
   nextAttemptAt: row.next_attempt_at ?? undefined,

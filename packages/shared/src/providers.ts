@@ -57,6 +57,8 @@ export interface VerifiedProviderWebhookEvent {
   status: ProviderStatus;
   progress?: number;
   download?: ProviderDownloadResult;
+  errorCode?: PublicErrorCode;
+  retryable?: boolean;
 }
 
 export interface ConversionProvider {
@@ -86,18 +88,26 @@ export interface ConversionProvider {
 }
 
 export class MockProvider implements ConversionProvider {
-  readonly id = "mock";
-  readonly displayName = "Mock Provider";
+  readonly id: string;
+  readonly displayName: string;
   private static readonly jobs = new Map<
     string,
     { scenario: string; polls: number; jobId: string }
   >();
   private readonly capabilities: ProviderCapabilities;
 
-  constructor(capabilities?: Partial<Pick<ProviderCapabilities, "formats" | "qualities">>) {
+  constructor(
+    capabilities?: Partial<Pick<ProviderCapabilities, "formats" | "qualities">> & {
+      id?: string;
+      displayName?: string;
+    },
+  ) {
+    this.id = capabilities?.id ?? "mock";
+    this.displayName = capabilities?.displayName ?? "Mock Provider";
     this.capabilities = {
       formats: capabilities?.formats ?? [...outputFormats],
       qualities: capabilities?.qualities ?? [...qualityOptions],
+      sourceExtensions: ["m3u8", "mp4", "webm", "mkv", "mp3", "m4a"],
       supportsWebhooks: true,
       supportsCancellation: true,
       supportsRefreshDownloadUrl: true,
@@ -113,7 +123,7 @@ export class MockProvider implements ConversionProvider {
     input: ProviderCreateJobInput,
     _context?: ProviderRequestContext,
   ): Promise<ProviderCreateJobResult> {
-    const scenario = input.scenario ?? scenarioFromUrl(input.sourceUrl);
+    const scenario = input.scenario ?? scenarioFromUrl(input.sourceUrl, this.id);
     if (scenario === "timeout") {
       throw new PublicApiError("provider_timeout", 504, "Mock timeout scenario");
     }
@@ -124,7 +134,8 @@ export class MockProvider implements ConversionProvider {
       throw new PublicApiError("provider_temporary_failure", 502, "Mock invalid response scenario");
     }
 
-    const providerJobId = `mock_${input.jobId}`;
+    const idempotencySuffix = (input.idempotencyKey ?? input.jobId).replace(/[^a-zA-Z0-9_-]/g, "_");
+    const providerJobId = `${this.id}_${idempotencySuffix}`;
     MockProvider.jobs.set(providerJobId, { scenario, polls: 0, jobId: input.jobId });
     return { providerJobId, status: scenario === "retry" ? "retrying" : "queued" };
   }
@@ -147,6 +158,16 @@ export class MockProvider implements ConversionProvider {
         stage: "failed",
         errorCode: "conversion_failed",
         retryable: false,
+      };
+    }
+    if (job.scenario === "async-fail") {
+      return {
+        providerJobId,
+        status: "failed",
+        progress: 100,
+        stage: "temporary provider failure",
+        errorCode: "provider_temporary_failure",
+        retryable: true,
       };
     }
     if (job.scenario === "permanent") {
@@ -214,6 +235,13 @@ export class MockProvider implements ConversionProvider {
         typeof body.outputUrl === "string"
           ? { url: body.outputUrl, mimeType: "video/mp4" }
           : undefined,
+      errorCode:
+        typeof body.errorCode === "string"
+          ? (body.errorCode as PublicErrorCode)
+          : body.status === "failed"
+            ? "provider_permanent_failure"
+            : undefined,
+      retryable: body.retryable === true,
     };
   }
 
@@ -254,12 +282,22 @@ export class CloudConvertProvider implements ConversionProvider {
   }
 
   async getCapabilities(): Promise<ProviderCapabilities> {
+    const qualities = this.config.qualities.filter((quality) =>
+      this.config.formats.some((format) => cloudConvertSupportsQuality(format, quality)),
+    );
     return {
       formats: this.config.formats,
-      qualities: this.config.qualities,
+      qualities,
+      sourceExtensions: [...cloudConvertSourceExtensions],
+      qualityFormats: Object.fromEntries(
+        qualities.map((quality) => [
+          quality,
+          this.config.formats.filter((format) => cloudConvertSupportsQuality(format, quality)),
+        ]),
+      ),
       supportsWebhooks: Boolean(this.config.webhookSigningSecret),
       supportsCancellation: false,
-      supportsRefreshDownloadUrl: true,
+      supportsRefreshDownloadUrl: false,
       maxInputUrlLength: 4096,
     };
   }
@@ -268,6 +306,8 @@ export class CloudConvertProvider implements ConversionProvider {
     input: ProviderCreateJobInput,
     context: ProviderRequestContext,
   ): Promise<ProviderCreateJobResult> {
+    const source = cloudConvertSource(input.sourceUrl);
+    const convertOptions = cloudConvertConversionOptions(input);
     const response = await this.request(context, "/jobs", {
       method: "POST",
       body: JSON.stringify({
@@ -276,11 +316,14 @@ export class CloudConvertProvider implements ConversionProvider {
           "import-source": {
             operation: "import/url",
             url: input.sourceUrl,
+            filename: source.filename,
           },
           "convert-output": {
             operation: "convert",
             input: "import-source",
+            input_format: source.inputFormat,
             output_format: input.format,
+            ...convertOptions,
           },
           "export-output": {
             operation: "export/url",
@@ -311,18 +354,8 @@ export class CloudConvertProvider implements ConversionProvider {
       progress: status === "completed" || status === "failed" ? 100 : cloudConvertProgress(job),
       stage: cloudConvertStage(job),
       download: cloudConvertDownload(job),
-      errorCode: status === "failed" ? "conversion_failed" : undefined,
-      retryable: false,
+      ...cloudConvertFailure(job),
     };
-  }
-
-  async refreshDownloadUrl(
-    providerJobId: string,
-    context: ProviderRequestContext,
-  ): Promise<ProviderDownloadResult> {
-    const status = await this.getJobStatus(providerJobId, context);
-    if (!status.download) throw new PublicApiError("output_expired", 400);
-    return status.download;
   }
 
   async verifyWebhook(request: Request): Promise<VerifiedProviderWebhookEvent> {
@@ -349,6 +382,7 @@ export class CloudConvertProvider implements ConversionProvider {
       status,
       progress: status === "completed" || status === "failed" ? 100 : cloudConvertProgress(job),
       download: cloudConvertDownload(job),
+      ...cloudConvertFailure(job),
     };
   }
 
@@ -396,6 +430,7 @@ export interface GenericHttpProviderConfig {
   cancelPath?: string;
   refreshPath?: string;
   webhookSecret?: string;
+  sourceExtensions?: string[];
   timeoutMs: number;
   enabled: boolean;
   priority: number;
@@ -445,6 +480,7 @@ export class GenericHttpProvider implements ConversionProvider {
     return {
       formats: ["mp4", "webm", "mkv", "mp3", "m4a"],
       qualities: ["source", "1080p", "720p", "480p", "audio"],
+      sourceExtensions: this.config.sourceExtensions,
       supportsWebhooks: Boolean(this.config.webhookSecret),
       supportsCancellation: Boolean(this.config.cancelPath),
       supportsRefreshDownloadUrl: Boolean(this.config.refreshPath),
@@ -520,18 +556,31 @@ export class GenericHttpProvider implements ConversionProvider {
     if (!this.config.refreshPath) {
       throw new PublicApiError("output_expired", 400, "Provider cannot refresh downloads");
     }
-    const response = await this.request(
-      context,
-      this.config.refreshPath.replace("{id}", providerJobId),
-      {
-        method: "POST",
-      },
-    );
+    let response: Response;
+    try {
+      response = await this.request(
+        context,
+        this.config.refreshPath.replace("{id}", providerJobId),
+        {
+          method: "POST",
+        },
+      );
+    } catch (error) {
+      if (error instanceof PublicApiError && (error.status === 404 || error.status === 410)) {
+        throw new PublicApiError("output_expired", 410, "Converted provider file was deleted");
+      }
+      throw error;
+    }
     const body = await response.json();
     if (!isRecord(body) || typeof body.url !== "string") {
       throw new PublicApiError("output_unavailable", 502, "Invalid provider download response");
     }
-    return { url: body.url };
+    return {
+      url: body.url,
+      expiresAt: typeof body.expiresAt === "string" ? body.expiresAt : undefined,
+      mimeType: typeof body.mimeType === "string" ? body.mimeType : undefined,
+      fileSize: typeof body.fileSize === "number" ? body.fileSize : undefined,
+    };
   }
 
   async verifyWebhook(request: Request): Promise<VerifiedProviderWebhookEvent> {
@@ -550,6 +599,13 @@ export class GenericHttpProvider implements ConversionProvider {
       status: normalizeProviderStatus(String(parsed.status ?? "processing")),
       progress: typeof parsed.progress === "number" ? parsed.progress : undefined,
       download: typeof parsed.outputUrl === "string" ? { url: parsed.outputUrl } : undefined,
+      errorCode:
+        typeof parsed.errorCode === "string"
+          ? (parsed.errorCode as PublicErrorCode)
+          : parsed.status === "failed"
+            ? "provider_permanent_failure"
+            : undefined,
+      retryable: parsed.retryable === true,
     };
   }
 
@@ -586,9 +642,11 @@ export class GenericHttpProvider implements ConversionProvider {
   }
 }
 
-const scenarioFromUrl = (rawUrl: string): string => {
+const scenarioFromUrl = (rawUrl: string, providerId = "mock"): string => {
   try {
     const parsed = new URL(rawUrl);
+    const providerScenario = parsed.searchParams.get(providerId);
+    if (providerScenario) return providerScenario;
     return parsed.searchParams.get("mock") ?? "success";
   } catch {
     return "success";
@@ -599,9 +657,14 @@ const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === "object" && value !== null && !Array.isArray(value);
 
 interface CloudConvertTask {
+  id?: string;
   name?: string;
   operation?: string;
   status?: string;
+  createdAt?: string;
+  endedAt?: string;
+  code?: string;
+  message?: string;
   result?: {
     files?: Array<{
       url?: string;
@@ -622,22 +685,7 @@ const readCloudConvertJob = (body: unknown): CloudConvertJob => {
     throw new PublicApiError("provider_temporary_failure", 502);
   }
   const tasks = Array.isArray(body.data.tasks)
-    ? body.data.tasks.filter(isRecord).map((task) => ({
-        name: typeof task.name === "string" ? task.name : undefined,
-        operation: typeof task.operation === "string" ? task.operation : undefined,
-        status: typeof task.status === "string" ? task.status : undefined,
-        result: isRecord(task.result)
-          ? {
-              files: Array.isArray(task.result.files)
-                ? task.result.files.filter(isRecord).map((file) => ({
-                    url: typeof file.url === "string" ? file.url : undefined,
-                    filename: typeof file.filename === "string" ? file.filename : undefined,
-                    size: typeof file.size === "number" ? file.size : undefined,
-                  }))
-                : undefined,
-            }
-          : undefined,
-      }))
+    ? body.data.tasks.filter(isRecord).map(readCloudConvertTaskRecord)
     : [];
   return {
     id: typeof body.data.id === "string" ? body.data.id : "",
@@ -645,6 +693,28 @@ const readCloudConvertJob = (body: unknown): CloudConvertJob => {
     tasks,
   };
 };
+
+const readCloudConvertTaskRecord = (task: Record<string, unknown>): CloudConvertTask => ({
+  id: typeof task.id === "string" ? task.id : undefined,
+  name: typeof task.name === "string" ? task.name : undefined,
+  operation: typeof task.operation === "string" ? task.operation : undefined,
+  status: typeof task.status === "string" ? task.status : undefined,
+  createdAt: typeof task.created_at === "string" ? task.created_at : undefined,
+  endedAt: typeof task.ended_at === "string" ? task.ended_at : undefined,
+  code: typeof task.code === "string" ? task.code : undefined,
+  message: typeof task.message === "string" ? task.message : undefined,
+  result: isRecord(task.result)
+    ? {
+        files: Array.isArray(task.result.files)
+          ? task.result.files.filter(isRecord).map((file) => ({
+              url: typeof file.url === "string" ? file.url : undefined,
+              filename: typeof file.filename === "string" ? file.filename : undefined,
+              size: typeof file.size === "number" ? file.size : undefined,
+            }))
+          : undefined,
+      }
+    : undefined,
+});
 
 const normalizeCloudConvertStatus = (status: string): ProviderStatus => {
   switch (status) {
@@ -659,15 +729,104 @@ const normalizeCloudConvertStatus = (status: string): ProviderStatus => {
   }
 };
 
+const cloudConvertSourceExtensions = [
+  "mp4",
+  "mov",
+  "webm",
+  "mkv",
+  "avi",
+  "mp3",
+  "m4a",
+  "wav",
+] as const;
+
+const cloudConvertSource = (sourceUrl: string): { inputFormat: string; filename: string } => {
+  let pathname: string;
+  try {
+    pathname = new URL(sourceUrl).pathname;
+  } catch {
+    throw new PublicApiError("unsupported_source", 400, "CloudConvert source URL is invalid");
+  }
+  const filename = pathname.split("/").filter(Boolean).at(-1);
+  const inputFormat = filename?.toLowerCase().match(/\.([a-z0-9]+)$/)?.[1];
+  if (!filename || !inputFormat) {
+    throw new PublicApiError("unsupported_source", 400, "CloudConvert requires a source filename");
+  }
+  if (inputFormat === "m3u8") {
+    throw new PublicApiError(
+      "unsupported_source",
+      400,
+      "CloudConvert HLS playlist conversion has not been verified for this adapter",
+    );
+  }
+  if (
+    !cloudConvertSourceExtensions.includes(
+      inputFormat as (typeof cloudConvertSourceExtensions)[number],
+    )
+  ) {
+    throw new PublicApiError("unsupported_source", 400);
+  }
+  return { inputFormat, filename };
+};
+
+const cloudConvertConversionOptions = (
+  input: ProviderCreateJobInput,
+): Record<string, string | number> => {
+  if (!cloudConvertSupportsQuality(input.format, input.quality)) {
+    throw new PublicApiError("unsupported_quality", 400);
+  }
+  if (input.quality === "source") return {};
+  if (input.quality === "1080p") return { width: 1920, height: 1080 };
+  if (input.quality === "720p") return { width: 1280, height: 720 };
+  if (input.quality === "480p") return { width: 854, height: 480 };
+  if (input.quality === "audio") return {};
+  throw new PublicApiError("unsupported_quality", 400);
+};
+
+const cloudConvertSupportsQuality = (format: OutputFormat, quality: QualityOption): boolean => {
+  const audioFormat = format === "mp3" || format === "m4a";
+  if (quality === "audio") return audioFormat;
+  if (quality === "source") return true;
+  return !audioFormat;
+};
+
 const cloudConvertDownload = (job: CloudConvertJob): ProviderDownloadResult | undefined => {
   const exportTask =
     job.tasks.find((task) => task.operation === "export/url") ??
     job.tasks.find((task) => task.name === "export-output");
+  return exportTask ? cloudConvertTaskDownload(exportTask) : undefined;
+};
+
+const cloudConvertTaskDownload = (
+  exportTask: CloudConvertTask,
+): ProviderDownloadResult | undefined => {
   const file = exportTask?.result?.files?.find((candidate) => candidate.url);
   if (!file?.url) return undefined;
   return {
     url: file.url,
+    expiresAt:
+      (exportTask.endedAt ?? exportTask.createdAt)
+        ? new Date(
+            new Date(exportTask.endedAt ?? exportTask.createdAt ?? "").getTime() +
+              24 * 60 * 60 * 1000,
+          ).toISOString()
+        : undefined,
     fileSize: file.size,
+  };
+};
+
+const cloudConvertFailure = (
+  job: CloudConvertJob,
+): Pick<ProviderJobStatusResult, "errorCode" | "retryable"> => {
+  if (normalizeCloudConvertStatus(job.status) !== "failed") return {};
+  const failedTask = job.tasks.find((task) => task.status === "error");
+  const diagnostic = `${failedTask?.code ?? ""} ${failedTask?.message ?? ""}`.toLowerCase();
+  const retryable = /timeout|rate.?limit|temporary|internal|server|network|unavailable/.test(
+    diagnostic,
+  );
+  return {
+    errorCode: retryable ? "provider_temporary_failure" : "provider_permanent_failure",
+    retryable,
   };
 };
 

@@ -165,7 +165,7 @@ describe("retry and provider behavior", () => {
     const created = await provider.createJob(
       {
         jobId: "job_1",
-        sourceUrl: "https://media.example.com/master.m3u8",
+        sourceUrl: "https://media.example.com/input.mp4",
         format: "mp4",
         quality: "source",
       },
@@ -180,13 +180,117 @@ describe("retry and provider behavior", () => {
     expect(created.providerJobId).toBe("cc_job_1");
     expect(requestBodies[0]).toMatchObject({
       tasks: {
-        "import-source": { operation: "import/url" },
-        "convert-output": { operation: "convert", output_format: "mp4" },
+        "import-source": { operation: "import/url", filename: "input.mp4" },
+        "convert-output": {
+          operation: "convert",
+          input_format: "mp4",
+          output_format: "mp4",
+        },
         "export-output": { operation: "export/url" },
       },
     });
     expect(status.status).toBe("completed");
     expect(status.download?.url).toContain("token=cc-token");
+  });
+
+  it("publishes accurate CloudConvert capabilities and maps quality options", async () => {
+    const requestBodies: Array<Record<string, unknown>> = [];
+    const provider = new CloudConvertProvider({
+      baseUrl: "https://api.cloudconvert.com/v2",
+      apiKey: "test-key",
+      timeoutMs: 1000,
+      formats: ["mp4", "mp3"],
+      qualities: ["source", "1080p", "720p", "480p", "audio"],
+    });
+    const fetcher: typeof fetch = async (_input, init) => {
+      if (init?.body) {
+        requestBodies.push(JSON.parse(String(init.body)) as Record<string, unknown>);
+      }
+      return Response.json({ data: { id: `cc_${requestBodies.length}`, status: "waiting" } });
+    };
+    const context = { requestId: "req", deadlineMs: Date.now() + 1000, fetcher };
+
+    const capabilities = await provider.getCapabilities();
+    expect(capabilities.sourceExtensions).not.toContain("m3u8");
+    expect(capabilities.supportsRefreshDownloadUrl).toBe(false);
+    expect(capabilities.qualityFormats).toMatchObject({
+      "1080p": ["mp4"],
+      "720p": ["mp4"],
+      "480p": ["mp4"],
+      audio: ["mp3"],
+    });
+
+    await provider.createJob(
+      {
+        jobId: "job_720",
+        sourceUrl: "https://media.example.com/video.mp4",
+        format: "mp4",
+        quality: "720p",
+      },
+      context,
+    );
+    await provider.createJob(
+      {
+        jobId: "job_audio",
+        sourceUrl: "https://media.example.com/video.mp4",
+        format: "mp3",
+        quality: "audio",
+      },
+      context,
+    );
+
+    expect(requestBodies[0]).toMatchObject({
+      tasks: {
+        "convert-output": { width: 1280, height: 720 },
+      },
+    });
+    expect(requestBodies[1]).toMatchObject({
+      tasks: {
+        "convert-output": { input_format: "mp4", output_format: "mp3" },
+      },
+    });
+    expect(
+      ((requestBodies[1]?.tasks as Record<string, Record<string, unknown>>)["convert-output"] ?? {})
+        .video_codec,
+    ).toBeUndefined();
+  });
+
+  it("rejects unverified M3U8 and missing-filename CloudConvert sources", async () => {
+    const provider = new CloudConvertProvider({
+      baseUrl: "https://api.cloudconvert.com/v2",
+      apiKey: "test-key",
+      timeoutMs: 1000,
+      formats: ["mp4"],
+      qualities: ["source"],
+    });
+    const context = {
+      requestId: "req",
+      deadlineMs: Date.now() + 1000,
+      fetcher: async () => Response.json({ data: { id: "unexpected", status: "waiting" } }),
+    };
+
+    await expect(
+      provider.createJob(
+        {
+          jobId: "job_m3u8",
+          sourceUrl: "https://media.example.com/master.m3u8",
+          format: "mp4",
+          quality: "source",
+        },
+        context,
+      ),
+    ).rejects.toMatchObject({ publicError: { code: "unsupported_source" } });
+    await expect(
+      provider.createJob(
+        {
+          jobId: "job_filename",
+          sourceUrl: "https://media.example.com/download",
+          format: "mp4",
+          quality: "source",
+        },
+        context,
+      ),
+    ).rejects.toMatchObject({ publicError: { code: "unsupported_source" } });
   });
 
   it("publishes a complete public error catalog", () => {

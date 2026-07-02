@@ -1,7 +1,7 @@
 import { zodResolver } from "@hookform/resolvers/zod";
 import { useMutation, useQuery } from "@tanstack/react-query";
 import { AlertTriangle, ArrowRight, ShieldCheck } from "lucide-react";
-import { useMemo } from "react";
+import { useEffect, useMemo } from "react";
 import { useForm } from "react-hook-form";
 import { useNavigate } from "react-router";
 import { z } from "zod";
@@ -9,7 +9,7 @@ import { Button, Field } from "@eliteconverter/ui";
 import { api } from "../lib/api";
 
 const schema = z.object({
-  url: z.string().url("Enter a valid M3U8 URL").max(4096),
+  url: z.string().url("Enter a valid media URL").max(4096),
   format: z.string().min(1),
   quality: z.string().min(1),
   callbackUrl: z.string().url("Enter a valid callback URL").optional().or(z.literal("")),
@@ -25,7 +25,7 @@ export const ConversionForm = ({ compact = false }: { compact?: boolean }) => {
   const capabilities = useQuery({ queryKey: ["capabilities"], queryFn: api.capabilities });
   const formats = capabilities.data?.formats ?? ["mp4", "webm", "mkv", "mp3", "m4a"];
   const qualities = capabilities.data?.qualities ?? ["source", "1080p", "720p", "480p", "audio"];
-  const defaultUrl = useMemo(() => "https://media.example.com/master.m3u8?mock=success", []);
+  const defaultUrl = useMemo(() => "https://media.example.com/input.mp4?mock=success", []);
 
   const form = useForm<FormValues>({
     resolver: zodResolver(schema),
@@ -37,6 +37,17 @@ export const ConversionForm = ({ compact = false }: { compact?: boolean }) => {
       permissionConfirmed: false,
     },
   });
+  const selectedFormat = form.watch("format");
+  const availableQualities =
+    capabilities.data?.qualityFormats[
+      selectedFormat as keyof typeof capabilities.data.qualityFormats
+    ] ?? qualities;
+
+  useEffect(() => {
+    if (!availableQualities.includes(form.getValues("quality") as never)) {
+      form.setValue("quality", availableQualities[0] ?? "source");
+    }
+  }, [availableQualities, form]);
 
   const mutation = useMutation({
     mutationFn: api.createPublicConversion,
@@ -56,8 +67,8 @@ export const ConversionForm = ({ compact = false }: { compact?: boolean }) => {
       <div className="form-grid">
         <Field
           id="url"
-          label="M3U8 URL"
-          placeholder="https://example.com/master.m3u8"
+          label="Source URL"
+          placeholder="https://example.com/input.mp4"
           {...form.register("url")}
           error={form.formState.errors.url?.message}
         />
@@ -74,7 +85,7 @@ export const ConversionForm = ({ compact = false }: { compact?: boolean }) => {
         <label className="ec-field" htmlFor="quality">
           <span>Quality</span>
           <select id="quality" {...form.register("quality")}>
-            {qualities.map((quality) => (
+            {availableQualities.map((quality) => (
               <option key={quality} value={quality}>
                 {quality === "audio" ? "Audio only" : quality}
               </option>

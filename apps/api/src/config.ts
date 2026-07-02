@@ -63,6 +63,16 @@ export const getConfig = (env: Env): AppConfig => {
       cancelPath: env.GENERIC_PROVIDER_CANCEL_PATH || undefined,
       refreshPath: env.GENERIC_PROVIDER_REFRESH_PATH || undefined,
       webhookSecret: env.GENERIC_PROVIDER_WEBHOOK_SECRET || undefined,
+      sourceExtensions: readList(env.GENERIC_PROVIDER_SOURCE_EXTENSIONS, [
+        "mp4",
+        "mov",
+        "webm",
+        "mkv",
+        "avi",
+        "mp3",
+        "m4a",
+        "wav",
+      ]),
       timeoutMs: readNumber(env.GENERIC_PROVIDER_TIMEOUT_MS, 10000),
     },
     cloudConvertProvider: {
@@ -85,6 +95,11 @@ export const getConfig = (env: Env): AppConfig => {
     maxAnonymousJobsPerDay: readNumber(env.MAX_ANONYMOUS_JOBS_PER_DAY, 20),
     callbackHostAllowlist: readList(env.CALLBACK_HOST_ALLOWLIST, []),
     clientWebhookMaxAttempts: readNumber(env.CLIENT_WEBHOOK_MAX_ATTEMPTS, 8),
+    queueMaxDeliveryAttempts: readNumber(env.QUEUE_MAX_DELIVERY_ATTEMPTS, 5),
+    queueLeaseSeconds: readNumber(env.QUEUE_LEASE_SECONDS, 60),
+    scheduledTaskLeaseSeconds: readNumber(env.SCHEDULED_TASK_LEASE_SECONDS, 300),
+    clientWebhookLeaseSeconds: readNumber(env.CLIENT_WEBHOOK_LEASE_SECONDS, 300),
+    clientWebhookTimeoutMs: readNumber(env.CLIENT_WEBHOOK_TIMEOUT_MS, 10000),
   };
 };
 
